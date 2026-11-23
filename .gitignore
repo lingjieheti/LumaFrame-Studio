@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+bin/
+.venv/
+.tools-cache/
+build-output/
+*.spec
+*.mkv
+*.hevc
+*.mp4
+*.rpu

@@ -1,0 +1,9 @@
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.ps1 text eol=crlf
+licenses/* -text
+*.glsl -text
+*.png binary
+*.ico binary
+*.jpg binary
