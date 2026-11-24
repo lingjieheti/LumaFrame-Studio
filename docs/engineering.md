@@ -19,4 +19,4 @@ Profile 7 的 BL 和 EL 分别携带基础画面和增强信息。dovi_tool 能�
 
 ## 界面
 
-设计参考 Apple HIG 对普通和清透玻璃材质的区分，以及 WWDC26 对侧边栏、边缘高光、材质浓度和可读性的调整。影片保持独立内容层。导航从缩略背景取色，预览按钮采样并扩散下方的图像，交互时绘制局部高光。Windows 实现使用 Qt 原生控件与自绘材质，无需 Apple 运行时。[Apple HIG](https://developer.apple.com/design/human-interface-guidelines/materials) · [WWDC26 界面设计更新](https://developer.apple.com/videos/play/wwdc2026/102/?id=206)
+影片作为内容层。浮动导航取色自当前封面或缩略图，导入按钮与预览共用居中裁切坐标，对按钮中心和边缘使用不同的背景采样。选中、悬停、键盘焦点各有独立状态。指针静止后，悬停过渡会结束。浓度滑块旁的色带用于对照扩散和着色。界面使用 Qt 在 Windows 本地绘制。设计取舍参考 Apple 对功能控件层、边缘反射、背景扩散和透明度偏好的说明。[Apple 材质指南](https://developer.apple.com/design/human-interface-guidelines/materials) · [WWDC25 材质设计](https://developer.apple.com/videos/play/wwdc2025/219/) · [WWDC26 材质更新](https://developer.apple.com/videos/play/wwdc2026/102/?time=190)

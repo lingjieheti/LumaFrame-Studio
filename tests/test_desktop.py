@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 import main
@@ -87,6 +87,30 @@ def run(source=None, pictures=None):
                 window.path.setCursorPosition(0)
                 spin(0.15)
                 screenshot("workspace-dual.png")
+        # At 125% scaling a small laptop can have fewer than 600 logical
+        # pixels available. Both actions must stay outside the scrolling form.
+        window.nav[0].click()
+        window.resize(720, 480)
+        spin(0.1)
+        for button in (window.previewbtn, window.renderbtn):
+            first = button.mapTo(window, QPoint(0, 0))
+            last = button.mapTo(window, button.rect().bottomRight())
+            assert button.isVisible() and window.rect().contains(first) and window.rect().contains(last)
+        for button in window.nav:
+            assert button.text() == "" and button.accessibleName()
+        window.nav[2].click()
+        # Higher density changes the live specimen, while opaque rendering is
+        # independent of density. Compare the actual paint result.
+        sample = window.material_sample
+        if window.allow_transparency:
+            window.slider.setValue(0)
+            clear = sample.grab().toImage()
+            window.slider.setValue(100)
+            assert clear != sample.grab().toImage()
+            window.solid_box.setChecked(True)
+            solid = sample.grab().toImage()
+            window.slider.setValue(0)
+            assert solid == sample.grab().toImage() and not window.slider.isEnabled()
         window.close()
         app.processEvents()
 

@@ -25,13 +25,15 @@ import threading
 import time
 from datetime import datetime
 from fractions import Fraction
-from PySide6.QtCore import Qt, QSettings, Signal, QUrl, QTimer, QObject
+from PySide6.QtCore import Qt, QEvent, QRectF, QSettings, Signal, QUrl, QTimer, QObject
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QFont,
     QIcon,
     QPixmap,
+    QPainter,
+    QPen,
     QPalette,
     QKeySequence,
     QShortcut,
@@ -44,6 +46,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QVBoxLayout,
     QHBoxLayout,
+    QBoxLayout,
     QComboBox,
     QCheckBox,
     QLineEdit,
@@ -52,11 +55,14 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QStackedWidget,
     QScrollArea,
+    QSizePolicy,
     QSlider,
 )
-from glass import ASSETS, GlassButton, Material, Rail, Stage, Select
+import glass
+from glass import ASSETS, GlassButton, Material, Rail, Stage, Select, ink
+from material_sample import MaterialSample
 
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 REPO = "https://github.com/lingjieheti/LumaFrame-Studio"
 SPONSOR = "https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md"
 TARGETS = {
@@ -80,6 +86,68 @@ def label(text, kind=""):
     w.setObjectName(kind)
     w.setTextFormat(Qt.PlainText)
     return w
+
+
+class ElidedLabel(QLabel):
+    """Keep the full text available to assistive tools while fitting the current width."""
+
+    def __init__(self, text, kind):
+        super().__init__(text)
+        self.setObjectName(kind)
+        self.setTextFormat(Qt.PlainText)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+    def paintEvent(self, event):
+        area = self.contentsRect()
+        painter = QPainter(self)
+        painter.setPen(self.palette().color(QPalette.WindowText))
+        caption = self.fontMetrics().elidedText(self.text(), Qt.ElideMiddle, area.width())
+        painter.drawText(area, self.alignment() | Qt.TextSingleLine, caption)
+
+
+class Glyph(QWidget):
+    def __init__(self, name, size=20):
+        super().__init__()
+        self.name = name
+        self.setFixedSize(size, size)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.scale(self.width() / 20, self.height() / 20)
+        color = self.palette().color(QPalette.PlaceholderText)
+        ink(painter, self.name, 0, 0, color)
+
+
+class SwitchBox(QCheckBox):
+    def __init__(self, text):
+        super().__init__(text)
+        self.setMinimumHeight(34)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def hitButton(self, pos):
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        dark = self.window().dark
+        track = QRectF(self.width() - 48, (self.height() - 23) / 2, 42, 23)
+        p.setPen(self.palette().color(QPalette.WindowText))
+        p.drawText(self.rect().adjusted(0, 0, -55, 0), Qt.AlignVCenter | Qt.AlignLeft, self.text())
+        off = "#60677c" if dark else "#8c94a6"
+        on = "#7977ed" if dark else "#5658c7"
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(on if self.isChecked() else off))
+        p.drawRoundedRect(track, 11.5, 11.5)
+        pos = track.right() - 20.5 if self.isChecked() else track.left() + 2.5
+        p.setBrush(QColor("#ffffff"))
+        p.drawEllipse(QRectF(pos, track.top() + 2.5, 18, 18))
+        if self.hasFocus():
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor("#a9adff" if dark else "#5459c1"), 2))
+            p.drawRoundedRect(track.adjusted(-3, -3, 3, 3), 14, 14)
 
 
 def layout(cls, parent, margin=0, gap=0):
@@ -148,11 +216,15 @@ class Studio(QMainWindow):
         self.settings = QSettings("LumaFrame", "Studio")
         self.dark = self.settings.value("dark", False, type=bool)
         self.solid = self.settings.value("reduceTransparency", False, type=bool)
-        self.density = self.settings.value("glassDensity", 45, type=int)
+        self.allow_transparency, self.allow_motion = glass.system_effects()
+        self.density = max(0, min(100, self.settings.value("glassDensity", 45, type=int)))
         self.setWindowTitle("LumaFrame Studio")
         self.setWindowIcon(QIcon(str(ASSETS / "icon.ico")))
-        self.resize(1050, 685)
-        self.setMinimumSize(820, 590)
+        available = self.screen().availableGeometry()
+        # Leave room for the native Windows title bar and resize frame on scaled displays.
+        width, height = available.width() - 16, available.height() - 48
+        self.setMinimumSize(min(720, width), min(480, height))
+        self.resize(min(1120, width), min(680, height))
         self.info = None
         self.busy = False
         self.custom_destination = None
@@ -182,114 +254,143 @@ class Studio(QMainWindow):
         ][:20]
         self.root = Material()
         self.setCentralWidget(self.root)
-        outer = layout(QHBoxLayout, self.root)
+        outer = layout(QHBoxLayout, self.root, 14, 0)
         rail = Rail()
-        rail.setFixedWidth(182)
+        self.rail = rail
+        rail.setFixedWidth(192)
         outer.addWidget(rail)
-        rb = layout(QVBoxLayout, rail, 12, 6)
-        rb.setContentsMargins(13, 29, 13, 17)
+        rb = layout(QVBoxLayout, rail, 12, 5)
+        rb.setContentsMargins(13, 24, 13, 20)
         brand = QWidget()
         bb = layout(QHBoxLayout, brand, 0, 8)
+        bb.setContentsMargins(6, 0, 0, 0)
         logo = QLabel()
-        logo.setPixmap(
-            QPixmap(str(ASSETS / "icon.png")).scaled(
-                36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-        )
+        logo.setFixedSize(36, 36)
+        logo.setScaledContents(True)
+        logo.setPixmap(QPixmap(str(ASSETS / "icon.png")))
         bb.addWidget(logo)
         brandtext = QWidget()
+        self.brandtext = brandtext
         bt = layout(QVBoxLayout, brandtext, 0, 0)
         bt.addWidget(label("LumaFrame", "brand"))
         bt.addWidget(label("STUDIO", "brandSmall"))
         bb.addWidget(brandtext)
         bb.addStretch()
         rb.addWidget(brand)
-        rb.addSpacing(31)
+        rb.addSpacing(29)
         self.nav = []
+        self.rail_labels = []
         for i, (title, glyph) in enumerate(
             [("影片工作台", "studio"), ("导出记录", "history"), ("外观与指南", "design")]
         ):
             b = GlassButton(title, glyph, "nav")
+            b.setCheckable(True)
             b.clicked.connect(lambda _, j=i: self.show_page(j))
             self.nav.append(b)
+            self.rail_labels.append((b, title))
             rb.addWidget(b)
         rb.addStretch()
+        divisor = QFrame()
+        divisor.setObjectName("rule")
+        divisor.setFixedHeight(1)
+        rb.addWidget(divisor)
+        rb.addSpacing(4)
         for txt, glyph, url in [("赞助作者", "heart", SPONSOR), ("GitHub", "link", REPO)]:
             b = GlassButton(txt, glyph, "nav")
             b.clicked.connect(lambda _, u=url: external(u))
+            self.rail_labels.append((b, txt))
             rb.addWidget(b)
+        for button, caption in self.rail_labels:
+            button.setToolTip(caption)
+            button.setAccessibleName(caption)
         self.stack = QStackedWidget()
         outer.addWidget(self.stack, 1)
         self.workspace = self.page("影片工作台")
         box = self.workspace
         self.stage = Stage()
         self.stage.dropFile.connect(self.load)
-        box.addWidget(self.stage)
-        sl = layout(QVBoxLayout, self.stage, 24, 5)
+        box.addWidget(self.stage, 1)
+        sl = layout(QVBoxLayout, self.stage, 26, 7)
+        sl.setContentsMargins(29, 20, 27, 21)
         sl.addStretch()
-        self.film = label("导入影片", "heroTitle")
+        self.film = ElidedLabel("导入影片", "heroTitle")
         sl.addWidget(self.film)
-        self.film_detail = label("将一个本地视频拖到这里，或选择文件。", "heroDetail")
+        self.film_detail = label("拖入本地视频，开始 4K 超分与杜比视界转换。", "heroDetail")
+        self.film_detail.setWordWrap(True)
+        self.stage.installEventFilter(self)
         sl.addWidget(self.film_detail)
         sl.addSpacing(7)
         self.pick = GlassButton("选择影片", "add", "hero")
-        self.pick.setFixedWidth(122)
+        self.pick.setFixedWidth(126)
+        self.pick.setToolTip("选择本地影片 (Ctrl+O)")
         self.pick.clicked.connect(self.choose)
         sl.addWidget(self.pick)
         sl.addStretch()
-        section = QWidget()
-        sh = layout(QHBoxLayout, section)
-        sh.addWidget(label("导出设置", "section"))
-        sh.addStretch()
-        self.gpu_label = label("检测图形设备…", "muted")
-        sh.addWidget(self.gpu_label)
-        box.addWidget(section)
-        self.events.gpu.connect(self.gpu_label.setText)
         card = QFrame()
         card.setObjectName("card")
         box.addWidget(card)
-        cg = layout(QVBoxLayout, card, 16, 11)
+        cg = layout(QVBoxLayout, card, 20, 13)
+        section = layout(QHBoxLayout, None, 0, 6)
+        section.addWidget(label("导出设置", "section"))
+        section.addStretch()
+        section.addWidget(Glyph("gpu", 15))
+        self.gpu_label = label("检测图形设备…", "device")
+        section.addWidget(self.gpu_label)
+        cg.addLayout(section)
+        self.events.gpu.connect(self.gpu_label.setText)
         self.targets = Select()
         self.modes = Select()
-
-        def row(title, widget, buddy=True):
-            line = QWidget()
-            h = layout(QHBoxLayout, line, 0, 12)
+        self.targets.setPlaceholderText("根据片源匹配")
+        self.modes.setPlaceholderText("根据分辨率推荐")
+        self.setting_fields = layout(QHBoxLayout, None, 0, 14)
+        for title, combo in [("输出格式", self.targets), ("画质模式", self.modes)]:
+            field = layout(QVBoxLayout, None, 0, 6)
             cap = label(title, "field")
-            cap.setMinimumWidth(85)
-            h.addWidget(cap)
-            if buddy:
-                cap.setBuddy(widget)
-            h.addWidget(widget, 1)
-            return line
-
-        cg.addWidget(row("输出格式", self.targets))
-        cg.addWidget(row("画质模式", self.modes))
-        pathfield = QWidget()
-        pb = layout(QHBoxLayout, pathfield, 0, 8)
+            cap.setBuddy(combo)
+            combo.setAccessibleName(title)
+            combo.setMinimumWidth(0)
+            combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            field.addWidget(cap)
+            field.addWidget(combo)
+            self.setting_fields.addLayout(field, 1)
+        cg.addLayout(self.setting_fields)
+        out = layout(QVBoxLayout, None, 0, 6)
+        pb = layout(QHBoxLayout, None, 0, 8)
         self.path = QLineEdit()
+        self.path.setAccessibleName("保存位置")
+        cap = label("保存位置", "field")
+        cap.setBuddy(self.path)
+        out.addWidget(cap)
         self.path.setReadOnly(True)
         self.path.setPlaceholderText("选择影片后自动生成")
-        pb.addWidget(self.path)
+        pb.addWidget(self.path, 1)
         self.browse = GlassButton("更改", "folder")
         self.browse.setFixedSize(84, 36)
         self.browse.clicked.connect(self.set_destination)
         pb.addWidget(self.browse)
-        cg.addWidget(row("保存位置", pathfield, False))
+        out.addLayout(pb)
+        cg.addLayout(out)
         self.hint = label("", "muted")
         self.hint.setWordWrap(True)
         cg.addWidget(self.hint)
         self.targets.currentIndexChanged.connect(self.target_change)
         self.modes.currentIndexChanged.connect(self.mode_change)
-        self.status = label("等待导入影片", "status")
+        box.addStretch()
+        self.status = label("", "status")
+        self.status.hide()
         self.status.setWordWrap(True)
-        box.addWidget(self.status)
+        dock = QFrame()
+        dock.setObjectName("actions")
+        dock_layout = layout(QVBoxLayout, dock, 0, 7)
+        dock_layout.setContentsMargins(0, 8, 0, 0)
+        self.page_host.addWidget(dock)
+        dock_layout.addWidget(self.status)
         self.bar = QProgressBar()
         self.bar.setRange(0, 100)
         self.bar.setTextVisible(False)
         self.bar.setFixedHeight(5)
         self.bar.hide()
-        box.addWidget(self.bar)
+        dock_layout.addWidget(self.bar)
         foot = QWidget()
         fh = layout(QHBoxLayout, foot, 0, 8)
         self.openbtn = GlassButton("打开目录", "folder")
@@ -317,8 +418,7 @@ class Studio(QMainWindow):
         self.renderbtn.setFixedWidth(163)
         self.renderbtn.clicked.connect(lambda: self.start())
         fh.addWidget(self.renderbtn)
-        box.addWidget(foot)
-        box.addStretch()
+        dock_layout.addWidget(foot)
         h = self.page("导出记录")
         self.history_host = QWidget()
         self.history_list = layout(QVBoxLayout, self.history_host, 0, 9)
@@ -327,13 +427,22 @@ class Studio(QMainWindow):
         pref = self.page("外观与指南")
         surface = QFrame()
         surface.setObjectName("card")
-        plo = layout(QVBoxLayout, surface, 19, 12)
+        swatch_row = layout(QHBoxLayout, surface, 21, 24)
+        plo = layout(QVBoxLayout, None, 0, 9)
+        swatch_row.addLayout(plo, 1)
+        self.material_sample = MaterialSample()
+        self.material_sample.setMinimumWidth(135)
+        self.material_sample.setMaximumWidth(210)
+        self.material_sample.setMinimumHeight(82)
+        self.material_sample.setMaximumHeight(125)
+        self.material_sample.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        swatch_row.addWidget(self.material_sample, 1)
         plo.addWidget(label("外观", "section"))
-        self.dark_box = QCheckBox("深色外观")
+        self.dark_box = SwitchBox("深色外观")
         self.dark_box.setChecked(self.dark)
         self.dark_box.toggled.connect(self.appearance)
         plo.addWidget(self.dark_box)
-        self.solid_box = QCheckBox("减少透明度")
+        self.solid_box = SwitchBox("减少透明度")
         self.solid_box.setChecked(self.solid)
         self.solid_box.toggled.connect(self.appearance)
         plo.addWidget(self.solid_box)
@@ -343,15 +452,21 @@ class Studio(QMainWindow):
         dr.addWidget(label("玻璃浓度", "field"))
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setAccessibleName("玻璃浓度")
+        self.slider.setMinimumHeight(27)
         self.slider.setRange(0, 100)
         self.slider.setValue(self.density)
-        self.slider.setEnabled(not self.solid)
+        self.slider.setEnabled(self.allow_transparency and not self.solid)
         self.slider.valueChanged.connect(self.density_change)
         dr.addWidget(self.slider, 1)
+        self.density_value = label(f"{self.density}%", "device")
+        self.density_value.setMinimumWidth(38)
+        self.density_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        dr.addWidget(self.density_value)
         plo.addWidget(density_row)
         guide = QFrame()
         guide.setObjectName("card")
-        gl = layout(QVBoxLayout, guide, 19, 11)
+        gl = layout(QVBoxLayout, guide, 21, 8)
+        gl.addWidget(label("转换指南", "section"))
         for title, body in [
             (
                 "保留原片",
@@ -370,7 +485,8 @@ class Studio(QMainWindow):
                 "成片为 HEVC Main 10 / MKV，保持原比例、帧时间和受支持的轨道。电视或播放器需支持相应的杜比视界 Profile 与 MKV。工作台缩略图仅用于定位影片。",
             ),
         ]:
-            gl.addWidget(label(title, "field"))
+            gl.addSpacing(3)
+            gl.addWidget(label(title, "guideTitle"))
             l = label(body, "muted")
             l.setWordWrap(True)
             gl.addWidget(l)
@@ -395,33 +511,70 @@ class Studio(QMainWindow):
                 name = out.stdout.decode(errors="replace").strip().splitlines()[0]
             except (OSError, IndexError, subprocess.TimeoutExpired):
                 name = "未检测到 NVIDIA GPU"
-            self.events.gpu.emit(name)
+            # The desktop window can close before the system GPU query returns.
+            try:
+                self.events.gpu.emit(name)
+            except RuntimeError:
+                return
 
         threading.Thread(target=probe_gpu, daemon=True).start()
 
     def page(self, title):
+        page = QWidget()
+        self.page_host = layout(QVBoxLayout, page, 0, 13)
+        self.page_host.setContentsMargins(24, 6, 10, 7)
+        self.page_host.addWidget(label(title, "title"))
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         wrap = QWidget()
         wrap.setObjectName("sheet")
-        v = layout(QVBoxLayout, wrap, 25, 13)
-        v.setContentsMargins(27, 23, 27, 19)
-        v.addWidget(label(title, "title"))
+        v = layout(QVBoxLayout, wrap, 0, 15)
         scroll.setWidget(wrap)
-        self.stack.addWidget(scroll)
+        self.page_host.addWidget(scroll, 1)
+        self.stack.addWidget(page)
         return v
 
     def show_page(self, i):
         self.stack.setCurrentIndex(i)
         for j, b in enumerate(self.nav):
             b.selected = i == j
+            b.setChecked(b.selected)
             b.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not hasattr(self, "setting_fields"):
+            return
+        compact = self.width() < 920
+        self.rail.setFixedWidth(68 if compact else 192)
+        self.brandtext.setVisible(not compact)
+        for button, caption in self.rail_labels:
+            button.setText("" if compact else caption)
+        self.setting_fields.setDirection(
+            QBoxLayout.TopToBottom if self.width() < 775 else QBoxLayout.LeftToRight
+        )
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "stage", None) and event.type() == QEvent.Resize:
+            width = self.stage.width()
+            self.film.setMaximumWidth(max(230, int(width * 0.57)))
+            self.film_detail.setMaximumWidth(max(235, int(width * 0.53)))
+        return super().eventFilter(obj, event)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow() and hasattr(self, "slider"):
+            effects = glass.system_effects()
+            if effects != (self.allow_transparency, self.allow_motion):
+                self.allow_transparency, self.allow_motion = effects
+                self.appearance()
 
     def appearance(self):
         self.dark = self.dark_box.isChecked()
         self.solid = self.solid_box.isChecked()
-        self.slider.setEnabled(not self.solid)
+        self.slider.setEnabled(self.allow_transparency and not self.solid)
         self.settings.setValue("dark", self.dark)
         self.settings.setValue("reduceTransparency", self.solid)
         self.apply_style()
@@ -429,14 +582,19 @@ class Studio(QMainWindow):
     def density_change(self, n):
         self.density = n
         self.settings.setValue("glassDensity", n)
-        for w in self.findChildren(Rail):
+        self.density_value.setText(f"{n}%")
+        self.material_sample.update()
+        for w in self.findChildren(Rail) + self.findChildren(GlassButton):
             w.update()
 
     def apply_style(self):
-        fg, mut, card, edge, inp = (
-            ("#edf0fa", "#b3b8ca", "#292b39", "#46495c", "#323544")
+        fg, mut, card, edge, inp, accent = (
+            ("#f0f2fb", "#b5bed1", "#252936", "#424859", "#1e222e", "#a5a8ff")
             if self.dark
-            else ("#232536", "#555c72", "#fafafd", "#d9dce7", "#f2f3f8")
+            else ("#20253a", "#535e75", "#fcfcff", "#d5dbe7", "#f2f4fa", "#5353bf")
+        )
+        field_bg = inp if self.solid or not self.allow_transparency else (
+            "rgba(24, 29, 42, 200)" if self.dark else "rgba(235, 239, 248, 150)"
         )
         palette = self.palette()
         for role, c in [
@@ -446,6 +604,8 @@ class Studio(QMainWindow):
             (QPalette.Text, fg),
             (QPalette.Button, inp),
             (QPalette.ButtonText, fg),
+            (QPalette.PlaceholderText, mut),
+            (QPalette.HighlightedText, "#ffffff"),
             (QPalette.Highlight, "#6662c5"),
         ]:
             palette.setColor(role, QColor(c))
@@ -453,19 +613,42 @@ class Studio(QMainWindow):
         self.setStyleSheet(f"""
         QWidget {{font-family:'Microsoft YaHei UI','Segoe UI';font-size:14px;color:{fg};}}
         QScrollArea,QScrollArea>QWidget>QWidget,#sheet, QLabel {{background:transparent;}}
-        QLabel#title {{font-size:30px;font-weight:700;}} QLabel#section {{font-size:18px;font-weight:650;}}
-        QLabel#brand {{font-family:'Segoe UI';font-size:18px;font-weight:700;}} QLabel#brandSmall {{font-family:'Segoe UI';font-size:9px;letter-spacing:2px;color:{mut};}}
-        QLabel#heroTitle {{color:white;font-size:27px;font-weight:650;}} QLabel#heroDetail {{font-size:13px;color:#e3e5f2;}}
-        QLabel#muted {{font-size:12px;color:{mut};}} QLabel#field,QLabel#status {{font-weight:600;}}
-        QFrame#card {{background:{card};border:1px solid {edge};border-radius:16px;}}
-        QLineEdit,QComboBox {{background:{inp};padding:6px 11px;border-radius:8px;border:1px solid {edge};min-height:21px;}}
-        QComboBox:focus,QLineEdit:focus {{border:1px solid #8382ca;}}
-        QComboBox::drop-down {{border:0;width:28px;background:transparent;}}
+        QLabel#title {{font-size:29px;font-weight:700;}}
+        QLabel#section {{font-size:19px;font-weight:650;}}
+        QLabel#brand {{font-family:'Segoe UI';font-size:18px;font-weight:700;}}
+        QLabel#brandSmall {{font-family:'Segoe UI';font-size:9px;letter-spacing:2.2px;color:{mut};}}
+        QLabel#heroTitle {{color:#ffffff;font-size:35px;font-weight:700;}}
+        QLabel#heroDetail {{font-size:14px;color:#f0f3ff;}}
+        QLabel#muted,QLabel#device {{font-size:12px;color:{mut};}}
+        QLabel#field {{font-size:13px;font-weight:600;color:{mut};}}
+        QLabel#guideTitle {{font-size:15px;font-weight:650;}}
+        QLabel#status {{font-size:13px;font-weight:500;}}
+        QFrame#card {{background:{card};border:1px solid {edge};border-radius:20px;}}
+        QFrame#rule {{background:{edge};border:0;}}
+        QFrame#actions {{background:transparent;border:0;border-top:1px solid {edge};}}
+        QLineEdit,QComboBox {{background:{field_bg};padding:7px 12px;border-radius:10px;border:1px solid {edge};min-height:20px;}}
+        QComboBox {{padding-right:28px;}}
+        QComboBox:disabled {{color:{mut};}}
+        QComboBox:enabled:hover,QLineEdit:hover {{border-color:{mut};}}
+        QComboBox:focus,QLineEdit:focus {{border:2px solid {accent};padding:6px 11px;}}
+        QComboBox:focus {{padding-right:27px;}}
+        QComboBox::drop-down {{border:0;width:26px;background:transparent;}}
         QComboBox::down-arrow {{width:0;height:0;}}
-        QComboBox QAbstractItemView {{background:{card};color:{fg};selection-background-color:#5958ba;selection-color:white;padding:4px;}}
-        QProgressBar {{background:{edge};border:none;border-radius:2px;}} QProgressBar::chunk {{background:#6d65d8;border-radius:2px;}}
-        QCheckBox {{spacing:9px;}} QScrollBar:vertical {{width:9px;background:transparent;}} QScrollBar::handle:vertical {{background:{edge};border-radius:4px;min-height:20px;}}
+        QComboBox QAbstractItemView {{background:{card};color:{fg};selection-background-color:#5356ba;selection-color:white;padding:5px;border:1px solid {edge};}}
+        QProgressBar {{background:{edge};border:none;border-radius:2px;}}
+        QProgressBar::chunk {{background:{accent};border-radius:2px;}}
+        QSlider::groove:horizontal {{background:{edge};height:4px;border-radius:2px;}}
+        QSlider::sub-page:horizontal {{background:{accent};border-radius:2px;}}
+        QSlider::handle:horizontal {{background:{card};border:1px solid {mut};width:16px;margin:-7px 0;border-radius:8px;}}
+        QSlider::handle:horizontal:focus {{border:2px solid {accent};}}
+        QSlider::sub-page:horizontal:disabled {{background:{edge};}}
+        QScrollBar:vertical {{width:9px;background:transparent;}} QScrollBar::handle:vertical {{background:{edge};border-radius:4px;min-height:20px;}}
         QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical {{height:0px;}}
+        QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical {{background:transparent;}}
+        QMessageBox {{background:{card};}}
+        QMessageBox QPushButton {{background:{inp};color:{fg};border:1px solid {edge};border-radius:8px;min-width:70px;padding:6px 12px;}}
+        QMessageBox QPushButton:focus {{border:2px solid {accent};padding:5px 11px;}}
+        QToolTip {{background:{card};color:{fg};border:1px solid {edge};padding:4px 7px;}}
         """)
         self.root.update()
         for w in self.findChildren(QWidget):
@@ -505,11 +688,13 @@ class Studio(QMainWindow):
         self.detailbtn.hide()
         self.bar.hide()
         self.path.clear()
-        self.film.setText(self.film.fontMetrics().elidedText(Path(path).name, Qt.ElideMiddle, 500))
+        self.refill_targets()
+        self.film.setText(Path(path).name)
         self.film.setToolTip(Path(path).name)
         self.film_detail.setText("正在读取视频轨道…")
         self.pick.setText("更换影片")
         self.status.setText("正在检测片源格式")
+        self.status.show()
         self.settings.setValue("inputDir", str(Path(path).parent))
 
         def read():
@@ -549,6 +734,7 @@ class Studio(QMainWindow):
         if seq != self.seq:
             return
         self.info = info
+        self.status.show()
         if err:
             self.film_detail.setText("无法读取影片")
             self.status.setText(err[:450])
@@ -571,6 +757,11 @@ class Studio(QMainWindow):
         self.targets.blockSignals(True)
         self.targets.clear()
         info = self.info or {}
+        if not info.get("supported"):
+            self.targets.blockSignals(False)
+            self.modes.clear()
+            self.hint.hide()
+            return
         keys = ["hdr10", "newdv"] if info.get("source_type") == "sdr" else ["preserve"]
         if info.get("can_keep7"):
             keys.insert(0, "keep7")
@@ -579,6 +770,7 @@ class Studio(QMainWindow):
             if key == "preserve" and info.get("dv_profile") in (5, 7):
                 caption = f"杜比视界 Profile {info['dv_profile']} → Profile 8.1"
             self.targets.addItem(caption, key)
+        self.targets.setCurrentIndex(0)
         self.targets.blockSignals(False)
         self.target_change()
 
@@ -609,6 +801,7 @@ class Studio(QMainWindow):
             elif key == "reference" and k in ("hdr10", "newdv"):
                 name = "Spline36 · 高位深扩展"
             self.modes.addItem(name, key)
+        self.modes.setCurrentIndex(0)
         self.modes.blockSignals(False)
         self.mode_change()
         self.suggest_dest()
@@ -631,6 +824,7 @@ class Studio(QMainWindow):
         elif self.targets.currentData() == "newdv":
             text += " 按新画面测量生成杜比动态元数据。"
         self.hint.setText(text)
+        self.hint.setVisible(bool(self.info and self.info.get("supported") and text))
 
     def suggest_dest(self):
         if not self.info or not self.info["supported"]:
@@ -722,6 +916,7 @@ class Studio(QMainWindow):
 
     def show_progress(self):
         if self.busy:
+            self.status.show()
             elapsed = int(time.monotonic() - self.started_at)
             minutes, seconds = divmod(elapsed, 60)
             hours, minutes = divmod(minutes, 60)
@@ -788,16 +983,22 @@ class Studio(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
         if not self.history:
-            self.history_list.addWidget(label("完成导出后，影片会显示在这里。", "muted"))
+            frame = QFrame()
+            frame.setObjectName("card")
+            v = layout(QVBoxLayout, frame, 32, 9)
+            v.addWidget(Glyph("history", 32), 0, Qt.AlignHCenter)
+            v.addWidget(label("暂无导出记录", "section"), 0, Qt.AlignHCenter)
+            v.addWidget(label("完成导出后，可在这里打开成片目录。", "muted"), 0, Qt.AlignHCenter)
+            self.history_list.addWidget(frame)
             return
         for r in self.history:
             frame = QFrame()
             frame.setObjectName("card")
-            h = layout(QHBoxLayout, frame, 12, 10)
+            h = layout(QHBoxLayout, frame, 18, 12)
             desc = QWidget()
             v = layout(QVBoxLayout, desc, 0, 4)
-            name = label(Path(r["path"]).name, "field")
-            name.setWordWrap(True)
+            name = ElidedLabel(Path(r["path"]).name, "guideTitle")
+            name.setToolTip(r["path"])
             v.addWidget(name)
             v.addWidget(
                 label(
