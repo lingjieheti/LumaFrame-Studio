@@ -143,6 +143,21 @@ def _log_tail(path, size=2300):
         return stream.read(size).decode("utf-8", "replace")
 
 
+def _verify_rtx_frames(output, expected, ffmpeg, run):
+    # NVDEC can check every decoded picture without re-decoding the movie on the CPU.
+    cmd = [ffmpeg, "-nostdin", "-v", "error", "-xerror"]
+    decode = ["-i", output, "-map", "0:v:0", "-fps_mode", "passthrough",
+              "-nostats", "-progress", "pipe:1", "-f", "null", "-"]
+    try:
+        result = run([*cmd, "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", *decode])
+    except RuntimeError:
+        # Some GPUs or drivers cannot decode this HEVC level. Keep a strict CPU fallback.
+        result = run([*cmd, *decode])
+    fields = dict(line.split("=", 1) for line in result.splitlines() if "=" in line)
+    if fields.get("progress") != "end" or fields.get("frame", "").strip() != str(expected):
+        raise ValueError("RTX 编码视频的实际解码帧数与合成帧数不匹配。")
+
+
 def bake(
     bl_hevc,
     el_hevc,
@@ -277,7 +292,7 @@ def bake(
                 if rtx:
                     for line in codec_status.readlines(8192):
                         message = line.decode("utf-8", "replace").strip()
-                        if message.startswith(("首次使用 RTX", "NVIDIA RTX Video")):
+                        if "VFX 运行库" in message or message.startswith("NVIDIA RTX Video"):
                             progress(first, message)
                 for line in status.readlines():
                     if line.startswith(b"frame=") and line[6:].strip().isdigit():
@@ -325,6 +340,8 @@ def bake(
                     **common,
                 )
         _stop(consumer)
+    if rtx:
+        _verify_rtx_frames(output, expected_frames, _tool("ffmpeg"), run)
     probe = json.loads(
         run(
             [
@@ -333,7 +350,7 @@ def bake(
                 "error",
                 "-select_streams",
                 "v:0",
-                "-count_frames" if direct else "-count_packets",
+                *([] if rtx else ["-count_frames" if direct else "-count_packets"]),
                 "-show_streams",
                 "-of",
                 "json",
@@ -348,8 +365,9 @@ def bake(
         "color_space": "bt2020nc",
         "color_transfer": "smpte2084",
         "color_primaries": "bt2020",
-        ("nb_read_frames" if direct else "nb_read_packets"): str(expected_frames),
     }
+    if not rtx:
+        expected["nb_read_frames" if direct else "nb_read_packets"] = str(expected_frames)
     if not direct:
         expected.update(width=width, height=height, chroma_location="topleft")
     # The RTX encoder inserts the supplied RPU. Raw HEVC need not expose a

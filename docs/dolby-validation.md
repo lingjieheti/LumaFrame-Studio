@@ -69,6 +69,13 @@ foreach ($clip in 'glass-p5.mp4','glass-p81.mp4','glass-4k.mkv') {
 
 曲线以 203 cd/m² 作为线性化后的参考白，从 120 cd/m² 起扩展高光，在映射后限制最亮 RGB 通道至 1000 cd/m²。接近白的区域可能被显著提亮，已经剪切的纹理无法恢复。转换后以实测色块为准，单个码值会受缩放、量化和压缩影响。[映射着色器源码](../shaders/SDR_highlights_1000.glsl)
 
-另用连续 3 帧色板、3 帧黑、3 帧白编码 HEVC，再调用 `hdr.measure_output` 和 `dovi.generate_rpu_from_measurements`。回读确认 9 条 RPU，镜头从第 0、3、6 帧开始。三个镜头测得的 12-bit PQ 最小 / 最大 / 平均分别为 0 / 3076 / 1814、5 / 5 / 5、3062 / 3062 / 3062；经 dovi_tool 的 CMv2.9 L1 取值约束，实际写入值为 0 / 3076 / 1814、5 / 2081 / 819、12 / 3062 / 3061。分析在宽 480 像素的副本上逐帧进行，可能漏掉很小的高亮点。新 RPU 是对映射画面的自动估计，原 SDR 片源没有可继承的杜比创作 trims。[测量着色器源码](../shaders/Measure_CIE_Y.glsl) · [dovi_tool 生成器](https://github.com/quietvoid/dovi_tool/blob/2.3.4/docs/generator.md)
+另用连续 3 帧色板、3 帧黑、3 帧白编码 HEVC，再调用 `hdr.measure_output` 和 `dovi.generate_rpu_from_measurements`。回读确认 9 条 RPU，镜头从第 0、3、6 帧开始。三个镜头测得的 12-bit PQ 最小 / 最大 / 平均分别为 0 / 3076 / 1814、5 / 5 / 5、3062 / 3062 / 3062；经 dovi_tool 的 CMv2.9 L1 取值约束，实际写入值为 0 / 3076 / 1814、5 / 2081 / 819、12 / 3062 / 3061。分析在宽 480 像素的副本上逐帧进行，可能漏掉很小的高亮点。新 RPU 是对映射画面的自动估计，原 SDR 片源没有可继承的杜比创作 trims。[1.1.1 测量着色器](https://github.com/lingjieheti/LumaFrame-Studio/blob/v1.1.1/shaders/Measure_CIE_Y.glsl) · [dovi_tool 生成器](https://github.com/quietvoid/dovi_tool/blob/2.3.4/docs/generator.md)
 
 Profile 7（含增强层）、Profile 8.4（HLG）以及加密输入不在此版本的验证与支持范围。真实 P5 样片只有一个镜头，缺少足以重建完整静态母版色度坐标的 RPU L9，本片仅写入可以追溯到原输入的静态信息。保留逐帧动态元数据不等于在所有电视、功放和播放软件上都能触发杜比视界。
+
+
+## 1.1.2 的自动 L1 分析
+
+从 BT.709 制作新杜比视界时，软件按最终 HEVC 画面的 PQ 编码 R、G、B 三个通道中最大值估算 L1。ETSI TS 103 572 对 min_PQ、max_PQ、avg_PQ 的定义均引用 PQ MaxRGB。旧版本使用线性加权的 CIE Y，饱和色的测量值因通道权重而偏低。分镜及 480 像素宽采样仍为软件近似。已有杜比片源使用原始元数据。[ETSI TS 103 572，第 11–12 页](https://www.etsi.org/deliver/etsi_ts/103500_103599/103572/01.03.01_60/ts_103572v010301p.pdf) · [新版着色器](../shaders/Measure_MaxRGB.glsl)
+
+使用 BT.2020/PQ、10 位有限范围 HEVC 无损色块，各取 3 帧。红、绿、蓝、灰的最大 PQ 通道值均设为 0.75，12 位理论值为 3071。实测新版读数依次为 3071、3067、3071、3071，旧版为 2478、2889、1861、3067。此处比较分析器读数，生成器写入 RPU 时还会执行 CMv2.9 的取值约束。

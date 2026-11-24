@@ -1,4 +1,4 @@
-# LumaFrame Studio 1.1.1 的第三方组件
+# LumaFrame Studio 1.1.2 的第三方组件
 
 从源码构建 Windows x64 版时，在项目根目录运行 `py -3.12 tools/fetch_tools.py`。脚本只使用 Python 标准库；解压 7z 需要已安装的 7-Zip。每次安装均验证完整下载的 SHA-256，再按文件清单提取到 `bin`、`shaders` 和 `licenses`。镜像缓存可用 `--cache` 指定，缓存文件同样经过校验。Python 包版本见 `requirements-build.txt`。[下载清单与完整校验值](tools/fetch_tools.py) · [7-Zip](https://www.7-zip.org/)
 

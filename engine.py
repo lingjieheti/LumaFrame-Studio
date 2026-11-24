@@ -151,6 +151,36 @@ def _probe(path, run):
     return data
 
 
+def _chapter_streams(path, data):
+    """Only discard a QuickTime text data track explicitly referenced as a chapter track."""
+    candidates = [
+        s for s in data["streams"]
+        if s.get("codec_type") == "data" and s.get("codec_tag_string") == "text" and s.get("id")
+    ]
+    if not candidates or not data.get("chapters") or "mov" not in data["format"]["format_name"].split(","):
+        return []
+    from profile7 import _boxes
+
+    candidates_by_id = {int(s["id"], 0): s for s in candidates}
+    chapter_ids = set()
+    with path.open("rb") as reader:
+        regions = [(0, path.stat().st_size)]
+        for name in (b"moov", b"trak", b"tref", b"chap"):
+            regions = [
+                (start, end) for a, b in regions
+                for tag, start, end in _boxes(reader, a, b) if tag == name
+            ]
+        for start, end in regions:
+            if (end - start) % 4:
+                continue
+            reader.seek(start)
+            for _ in range(start, end, 4):
+                track_id = int.from_bytes(reader.read(4), "big")
+                if track_id in candidates_by_id:
+                    chapter_ids.add(track_id)
+    return [stream for track_id, stream in candidates_by_id.items() if track_id in chapter_ids]
+
+
 def _video(data):
     videos = [
         s
@@ -304,9 +334,8 @@ def _inspect(path, data, run, *, sample_layers=True):
                 info["profile"] += f" · {layer}"
             except (ValueError, RuntimeError) as exc:
                 info.update(supported=False, can_keep7=False, reason=str(exc))
-    if info["source_type"] == "sdr" and info["assumptions"]:
-        # An elementary HEVC stream can carry RPU NALs without a container
-        # configuration record. Do not let the HD/BT.709 fallback consume them.
+    if info["source_type"] == "sdr":
+        # Transport streams can retain in-band RPU even when their VUI says BT.709.
         idx = _video(data)["index"]
         records = run(
             [
@@ -316,7 +345,7 @@ def _inspect(path, data, run, *, sample_layers=True):
                 "-select_streams",
                 str(idx),
                 "-read_intervals",
-                "%+#12",
+                "%+#32",
                 "-show_frames",
                 "-show_entries",
                 "frame=pts_time:frame_side_data=side_data_type",
@@ -325,35 +354,47 @@ def _inspect(path, data, run, *, sample_layers=True):
                 path,
             ]
         )
-        markers = ("dolby vision", "dovi", "mastering display", "hdr dynamic", "content light")
+        markers = ("dolby vision", "dovi", "hdr dynamic", "smpte2094", "smpte 2094")
+        if info["assumptions"]:
+            markers += ("mastering display", "content light")
         if any(key in records.lower() for key in markers):
             info.update(
                 supported=False,
                 source_type="other",
                 profile="",
                 assumptions=[],
-                reason="画面包含 HDR 元数据但容器缺少可确认的色彩标记，无法按 SDR 处理。",
+                reason="帧内 HDR 元数据与 SDR 色彩标记或推定的 BT.709 冲突，请核对片源。",
             )
     return info
 
 
-def inspect_source(path):
+def inspect_source(path, *, cancel=None):
     path = Path(path).resolve(strict=True)
-    run = _Runner(None)
+    run = _Runner(cancel)
     return _inspect(path, _probe(path, run), run)
 
 
-def _times(path, index, run, *, coded_order=False):
+def _times(path, index, run, *, coded_order=False, with_end=False):
     # Packet PTS is in presentation order after sorting, even with B-frame reordering.
     times = []
+    last_pts = end = None
 
     def packet(line):
-        token = line.partition(",")[0].strip()
+        nonlocal last_pts, end
+        fields = line.split(",", 2)
+        token = fields[0].strip()
         if not token:
             return
         if not re.fullmatch(r"-?\d+(\.\d+)?", token):
             raise ValueError("视频缺少可还原的显示时间戳。")
-        times.append(round(float(token) * 1_000_000))
+        pts = round(float(token) * 1_000_000)
+        times.append(pts)
+        if with_end and (last_pts is None or pts > last_pts):
+            last_pts, end = pts, None
+            if len(fields) > 1 and re.fullmatch(r"\d+(\.\d+)?", fields[1]):
+                duration = round(float(fields[1]) * 1_000_000)
+                if duration > 0:
+                    end = pts + duration
 
     run(
         [
@@ -364,7 +405,7 @@ def _times(path, index, run, *, coded_order=False):
             str(index),
             "-show_packets",
             "-show_entries",
-            "packet=pts_time:packet_side_data=",
+            "packet=pts_time,duration_time:packet_side_data=" if with_end else "packet=pts_time:packet_side_data=",
             "-of",
             "csv=p=0",
             path,
@@ -376,7 +417,7 @@ def _times(path, index, run, *, coded_order=False):
         raise ValueError("视频显示时间戳为空或重复，无法保证逐帧同步。")
     if not coded_order:
         times.sort()
-    return times
+    return (times, end) if with_end else times
 
 
 def _static_hdr(path, video, run):
@@ -680,7 +721,27 @@ def _hash_container(path, cancel, progress, *, copy_to=None):
     return digest.hexdigest()
 
 
-def _mux(source, encoded, out, info, timing, original, run, audio_starts):
+def _chapter_xml(path, chapters, language):
+    from xml.etree import ElementTree as ET
+
+    def timecode(value, time_base):
+        ns = round(int(value) * Fraction(time_base) * 1_000_000_000)
+        sec, frac = divmod(ns, 1_000_000_000)
+        return f"{sec // 3600:02}:{sec // 60 % 60:02}:{sec % 60:02}.{frac:09}"
+
+    root = ET.Element("Chapters")
+    edition = ET.SubElement(root, "EditionEntry")
+    for ch in chapters:
+        atom = ET.SubElement(edition, "ChapterAtom")
+        for key, tag in (("start", "ChapterTimeStart"), ("end", "ChapterTimeEnd")):
+            ET.SubElement(atom, tag).text = timecode(ch[key], ch["time_base"])
+        display = ET.SubElement(atom, "ChapterDisplay")
+        ET.SubElement(display, "ChapterString").text = ch.get("tags", {}).get("title", "")
+        ET.SubElement(display, "ChapterLanguage").text = language
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+
+def _mux(source, encoded, out, info, timing, original, run, audio_starts, chapter_file=None):
     video = [t for t in original["tracks"] if t["type"] == "video"][info.get("base_ordinal", 0)]
     props = video["properties"]
     fps = _ratio(info["fps"])
@@ -708,11 +769,16 @@ def _mux(source, encoded, out, info, timing, original, run, audio_starts):
     ):
         if flag in props:
             args += ["--" + option, "0:" + str(int(props[flag]))]
+    if chapter_file:
+        args += ["--chapters", chapter_file]
     args += [encoded, "--no-video"]
+    if chapter_file:
+        args.append("--no-chapters")
     if original["container"].get("type") == "MP4/QuickTime":
         # Matroska has no AAC edit list. mkvmerge keeps the priming access unit
         # and shifts the next audible packet forward unless explicitly corrected.
         tracks = [t for t in original["tracks"] if t["type"] == "audio"]
+        earliest = 0.0
         for track, packets in zip(tracks, audio_starts):
             if track["codec"] == "AAC" and packets:
                 first = packets[0]
@@ -720,12 +786,36 @@ def _mux(source, encoded, out, info, timing, original, run, audio_starts):
                 if pts < 0 and any(
                     s.get("skip_samples", 0) for s in first.get("side_data_list", [])
                 ):
-                    args += ["--sync", f"{track['id']}:{round(pts * 1000)}"]
+                    earliest = min(earliest, pts)
+        if earliest < 0:
+            # The MP4 reader shifts all selected tracks onto the same non-negative
+            # timeline, including delayed commentary and subtitles.
+            for track in original["tracks"]:
+                if track["type"] in {"audio", "subtitles"}:
+                    args += ["--sync", f"{track['id']}:{round(earliest * 1000)}"]
     args.append(source)
     run(args)
 
 
-def _verify_other(source, output, original, result, common_offset):
+def _text_cues(path, indexes, run):
+    """Use FFmpeg's decoded subtitle events; tx3g also contains empty clearing samples."""
+    rows = [[] for _ in indexes]
+    mapping = [part for index in indexes for part in ("-map", f"0:{index}")]
+
+    def receive(line):
+        if not line or line.startswith("#"):
+            return
+        track, _, pts, duration, _, _ = line.split(",", 5)
+        rows[int(track)].append((int(pts), int(duration)))
+
+    run([_tool("ffmpeg"), "-v", "error", "-nostdin", "-copyts", "-i", path, *mapping,
+         "-c:s", "srt", "-enc_time_base:s", "1:1000000", "-f", "framehash", "pipe:1"],
+        receive, collect=False)
+    return rows
+
+
+def _verify_other(source, output, original, result, chapter_streams, explicit_chapter_ends,
+                  source_path, output_path, run):
     def tracks(data):
         return [t for t in data["tracks"] if t["type"] != "video"]
 
@@ -759,9 +849,11 @@ def _verify_other(source, output, original, result, common_offset):
     def nonvideo(data):
         return [s for s in data["streams"] if s["codec_type"] in ("audio", "subtitle", "data")]
 
-    a, b = nonvideo(source), nonvideo(output)
+    a = [s for s in nonvideo(source) if s not in chapter_streams]
+    b = nonvideo(output)
     if len(a) != len(b):
         raise ValueError("封装后音频、字幕或数据轨数量变化。")
+    converted = []
     for s, d in zip(a, b):
         sc, dc = s.get("codec_name"), d.get("codec_name")
         if sc != dc and (sc, dc) not in {("mov_text", "subrip"), ("text", "subrip")}:
@@ -771,9 +863,18 @@ def _verify_other(source, output, original, result, common_offset):
             d.get("sample_rate"),
         ):
             raise ValueError("音轨声道数或采样率发生变化。")
-        if s["codec_type"] == "subtitle" and "start_time" in s and "start_time" in d:
+        if (sc, dc) == ("mov_text", "subrip"):
+            converted.append((s["index"], d["index"]))
+        elif s["codec_type"] == "subtitle" and "start_time" in s and "start_time" in d:
             if abs(float(s["start_time"]) - float(d["start_time"])) > 0.003:
                 raise ValueError("字幕轨的起始时间发生了变化。")
+    if converted:
+        src_idx, dst_idx = zip(*converted)
+        for before, after in zip(_text_cues(source_path, src_idx, run),
+                                 _text_cues(output_path, dst_idx, run)):
+            if len(before) != len(after) or any(abs(p - q) > 3000 or abs(d - e) > 3000
+                                              for (p, d), (q, e) in zip(before, after)):
+                raise ValueError("转换后字幕的显示时间、时长或条数发生了变化。")
 
     def attachments(data):
         return Counter((t.get("file_name"), t.get("size")) for t in data.get("attachments", []))
@@ -784,8 +885,10 @@ def _verify_other(source, output, original, result, common_offset):
     if len(src_ch) != len(dst_ch):
         raise ValueError("章节数量校验失败。")
     for x, y in zip(src_ch, dst_ch):
-        if abs(float(x["start_time"]) + common_offset - float(y["start_time"])) > 0.003:
+        if abs(float(x["start_time"]) - float(y["start_time"])) > 0.003:
             raise ValueError("章节时间校验失败。")
+        if explicit_chapter_ends and abs(float(x["end_time"]) - float(y["end_time"])) > 0.003:
+            raise ValueError("章节结束时间校验失败。")
         if x.get("tags", {}).get("title") != y.get("tags", {}).get("title"):
             raise ValueError("章节名称校验失败。")
 
@@ -856,7 +959,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
         scratch = Path(folder)
         run.worker_cancel = scratch / "cancel.rtx"
         progress(2, "读取原片逐帧时间戳")
-        coded_times = _times(source, video["index"], run, coded_order=True)
+        coded_times, video_end = _times(source, video["index"], run, coded_order=True, with_end=True)
         if info["el_index"] is not None:
             el_times = _times(source, info["el_index"], run, coded_order=True)
             if len(coded_times) != len(el_times) or any(
@@ -877,6 +980,9 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
             with timing.open("w", encoding="ascii", newline="\n") as output_times:
                 output_times.write("# timestamp format v2\n")
                 output_times.writelines(f"{t / 1000:.3f}\n" for t in times)
+                if video_end is not None:
+                    # mkvmerge uses the extra boundary to set the final frame's BlockDuration.
+                    output_times.write(f"{video_end / 1000:.3f}\n")
         rpu = scratch / "scaled.rpu"
         encoded = scratch / "encoded.hevc"
         picture, picture_video = source, video
@@ -1052,12 +1158,18 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
         progress(84, "按原时间戳封装视频及原片轨道")
         muxed = scratch / "verified.mkv"
         starts = _audio_starts(source, data, run)
+        chapter_streams = _chapter_streams(source, data)
+        chapter_file = None
+        if len(chapter_streams) == 1 and all("end" in ch for ch in data["chapters"]):
+            chapter_file = scratch / "chapters.xml"
+            language = chapter_streams[0].get("tags", {}).get("language") or "und"
+            _chapter_xml(chapter_file, data["chapters"], language)
         container_digest = None
         if copy_container:
             with muxed.open("xb") as outgoing:
                 container_digest = _hash_container(source, cancel, progress, copy_to=outgoing)
         else:
-            _mux(source, encoded, muxed, info, timing, original, run, starts)
+            _mux(source, encoded, muxed, info, timing, original, run, starts, chapter_file)
             encoded.unlink()
         progress(90, "复读输出并核验逐帧时间、色彩与副轨")
         out_data = _probe(muxed, run)
@@ -1089,13 +1201,18 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
             tier, dv_level = _check_dv_tier(muxed, out_video, cfg, cap, run)
         elif any("dv_profile" in s for s in out_video.get("side_data_list", [])):
             raise ValueError("HDR10 输出意外携带杜比视界配置。")
-        out_times = _times(muxed, out_video["index"], run)
+        out_times, out_end = _times(muxed, out_video["index"], run, with_end=True)
         if len(out_times) != len(times) or max(abs(a - b) for a, b in zip(times, out_times)) > 1200:
             raise ValueError("输出帧数或逐帧显示时间与原片不一致。")
+        if video_end is not None and (out_end is None or abs(video_end - out_end) > 1200):
+            raise ValueError("输出视频的末帧显示时长与原片不一致。")
         out_master, out_cll = _static_hdr(muxed, out_video, run)
         if (master and master != out_master) or (cll and cll != out_cll):
             raise ValueError("输出静态 HDR 母版或亮度元数据未保留。")
-        _verify_other(data, out_data, original, _mkv_inventory(muxed, run), 0)
+        _verify_other(
+            data, out_data, original, _mkv_inventory(muxed, run), chapter_streams,
+            bool(chapter_file), source, muxed, run,
+        )
         for a, b in zip(starts, _audio_starts(muxed, out_data, run)):
             # Match encoded packets by hash, not by index: container-specific
             # codec priming can be removed on remux without removing audible audio.

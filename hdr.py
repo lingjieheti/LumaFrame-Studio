@@ -34,7 +34,7 @@ def sdr_filter(width, height, target_width, target_height, mode):
 
 
 def _scene(start, length, minimum, maximum, total):
-    # signalstats runs on neutral 10-bit limited-range PQ(CIE Y) measurements.
+    # signalstats runs on neutral 10-bit limited-range PQ MaxRGB measurements.
     def pq(code):
         return max(0, min(4095, round((code - 64) * 4095 / 876)))
 
@@ -48,14 +48,13 @@ def _scene(start, length, minimum, maximum, total):
 
 
 def measure_output(base_file, work_dir, run):
-    stats = Path(work_dir) / "luminance.txt"
     exe = ROOT / "bin" / "ffmpeg.exe"
     ffmpeg = str(exe) if exe.exists() else shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("找不到 FFmpeg，无法测量输出亮度。")
-    # Detect cuts before converting decoded PQ pixels to linear-light luminance.
+    # Detect cuts before converting decoded PQ pixels to neutral PQ MaxRGB.
     # A 480-pixel analysis copy makes long-form use practical; tiny peaks can be missed.
-    measurement_shader = ROOT / "shaders" / "Measure_CIE_Y.glsl"
+    measurement_shader = ROOT / "shaders" / "Measure_MaxRGB.glsl"
     init = ["-init_hw_device", "vulkan=lf:,vendor_id=0x10de", "-filter_hw_device", "lf"]
     vf = (
         "scale=w=480:h=-2:flags=area,format=yuv420p10le,scdet=threshold=8,hwupload,"
@@ -63,28 +62,7 @@ def measure_output(base_file, work_dir, run):
         "color_primaries=bt2020:colorspace=bt2020nc:color_trc=smpte2084:range=tv:custom_shader_path="
         + filter_path(measurement_shader)
         + ",hwdownload,format=yuv420p10le,"
-        "signalstats,metadata=mode=print:file=" + filter_path(stats)
-    )
-    run(
-        [
-            ffmpeg,
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            *init,
-            "-i",
-            str(base_file),
-            "-map",
-            "0:v:0",
-            "-an",
-            "-sn",
-            "-vf",
-            vf,
-            "-f",
-            "null",
-            "-",
-        ]
+        "signalstats,metadata=mode=print:file=-:direct=1"
     )
     frames = 0
     start, length, minimum, maximum, total = 0, 0, 1023.0, 0.0, 0.0
@@ -105,16 +83,39 @@ def measure_output(base_file, work_dir, run):
         length += 1
         frames += 1
 
-    with stats.open(encoding="utf-8") as records:
-        for raw in records:
-            line = raw.strip()
-            if line.startswith("frame:"):
-                accept()
-                fields = {"frame": re.match(r"frame:(\d+)", line).group(1)}
-            elif "=" in line:
-                key, value = line.split("=", 1)
-                fields[key] = value
-        accept()
+    def parse_line(line):
+        nonlocal fields
+        if line.startswith("frame:"):
+            accept()
+            fields = {"frame": re.match(r"frame:(\d+)", line).group(1)}
+        elif line.startswith(("lavfi.signalstats.Y", "lavfi.scd.score=")):
+            key, _, value = line.partition("=")
+            fields[key] = value
+
+    run(
+        [
+            ffmpeg,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            *init,
+            "-i",
+            str(base_file),
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-vf",
+            vf,
+            "-f",
+            "null",
+            "-",
+        ],
+        parse_line,
+        collect=False,
+    )
+    accept()
     if not frames:
         raise ValueError("没有可分析的输出画面。")
     scenes.append(_scene(start, length, minimum, maximum, total))

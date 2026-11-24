@@ -43,6 +43,8 @@ class DemuxPipeTests(unittest.TestCase):
 
                 def record_start(*args, **kwargs):
                     process = start(*args, **kwargs)
+                    if args[0][0] == "taskkill":
+                        return process
                     children.append(process)
                     if direction == "cancel" and len(children) == 2:
                         cancel.set()

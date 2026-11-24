@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -216,7 +217,16 @@ def run_pipe(upstream, downstream, run, work):
         finally:
             for process in (consumer, producer):
                 if process is not None and process.poll() is None:
-                    process.kill()
+                    # A Windows launcher can have a child holding the diagnostic
+                    # file or pipe after the launcher itself is terminated.
+                    if os.name == "nt":
+                        subprocess.run(
+                            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, creationflags=flags,
+                        )
+                    if process.poll() is None:
+                        process.kill()
             for process in (consumer, producer):
                 if process is not None:
                     process.wait()

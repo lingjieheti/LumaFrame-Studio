@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
 )
 from glass import ASSETS, GlassButton, Material, Rail, Stage, Select
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 REPO = "https://github.com/lingjieheti/LumaFrame-Studio"
 SPONSOR = "https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md"
 TARGETS = {
@@ -107,8 +107,35 @@ def available_destination(path):
     return candidate
 
 
+def poster_frame(path, info, cancel):
+    if info.get("dv_profile") in (5, 7) or cancel.is_set():
+        return b""
+    vf = "scale=640:-2"
+    if info["source_type"] == "dv":
+        vf = "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=mobius,zscale=p=bt709:t=bt709:m=bt709:r=limited,format=yuv420p,scale=640:-2"
+    timestamp = min(max(info["duration"] * 0.10, 0), 25)
+    args = [
+        str(ROOT / "bin" / "ffmpeg.exe"), "-nostdin", "-v", "error", "-ss", str(timestamp),
+        "-i", path, "-map", "0:V:0", "-frames:v", "1", "-vf", vf, "-c:v", "mjpeg",
+        "-f", "image2pipe", "-",
+    ]
+    with subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, creationflags=HIDE) as process:
+        deadline = time.monotonic() + 12
+        while not cancel.is_set() and time.monotonic() < deadline:
+            try:
+                data, _ = process.communicate(timeout=0.15)
+                return data if process.returncode == 0 else b""
+            except subprocess.TimeoutExpired:
+                continue
+        process.kill()
+        process.communicate()
+        return b""
+
+
 class Events(QObject):
     inspected = Signal(int, object, str)
+    inspection_done = Signal(object)
     poster = Signal(int, bytes)
     state = Signal(float, str)
     complete = Signal(object, str)
@@ -131,9 +158,12 @@ class Studio(QMainWindow):
         self.custom_destination = None
         self.failure_detail = ""
         self.seq = 0
+        self.inspections = set()
+        self.close_after = False
         self.cancel_event = threading.Event()
         self.events = Events(self)
         self.events.inspected.connect(self.got_info)
+        self.events.inspection_done.connect(self.inspection_done)
         self.events.poster.connect(self.got_poster)
         self.events.state.connect(self.update_progress)
         self.events.complete.connect(self.finished)
@@ -141,9 +171,15 @@ class Studio(QMainWindow):
         self.clock.setInterval(1000)
         self.clock.timeout.connect(self.show_progress)
         try:
-            self.history = json.loads(str(self.settings.value("history", "[]")))[:20]
+            saved = json.loads(str(self.settings.value("history", "[]")))
         except (ValueError, TypeError):
-            self.history = []
+            saved = []
+        self.history = [
+            item for item in (saved if isinstance(saved, list) else [])
+            if isinstance(item, dict)
+            and all(isinstance(item.get(key), str) for key in ("path", "time", "target"))
+            and isinstance(item.get("n"), int) and item["path"]
+        ][:20]
         self.root = Material()
         self.setCentralWidget(self.root)
         outer = layout(QHBoxLayout, self.root)
@@ -452,8 +488,12 @@ class Studio(QMainWindow):
             self.load(path)
 
     def load(self, path):
-        if self.busy:
+        if self.busy or self.close_after:
             return
+        for pending in self.inspections:
+            pending.set()
+        cancel = threading.Event()
+        self.inspections.add(cancel)
         self.seq += 1
         seq = self.seq
         self.info = None
@@ -476,50 +516,26 @@ class Studio(QMainWindow):
             try:
                 import engine
 
-                result = engine.inspect_source(path)
-                self.events.inspected.emit(seq, result, "")
-                if not result["supported"]:
+                result = engine.inspect_source(path, cancel=cancel)
+                if cancel.is_set():
                     return
-                exe = ROOT / "bin" / "ffmpeg.exe"
-                t = min(max(result["duration"] * 0.10, 0), 25)
-                vf = "scale=640:-2"
-                if result["source_type"] == "dv":
-                    vf = "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=mobius,zscale=p=bt709:t=bt709:m=bt709:r=limited,format=yuv420p,scale=640:-2"
-                    if result.get("dv_profile") in (5, 7):
-                        return
-                p = subprocess.run(
-                    [
-                        str(exe),
-                        "-nostdin",
-                        "-v",
-                        "error",
-                        "-ss",
-                        str(t),
-                        "-i",
-                        path,
-                        "-map",
-                        "0:V:0",
-                        "-frames:v",
-                        "1",
-                        "-vf",
-                        vf,
-                        "-c:v",
-                        "mjpeg",
-                        "-f",
-                        "image2pipe",
-                        "-",
-                    ],
-                    capture_output=True,
-                    timeout=12,
-                    creationflags=HIDE,
-                )
-                if p.returncode == 0 and p.stdout:
-                    self.events.poster.emit(seq, p.stdout)
+                self.events.inspected.emit(seq, result, "")
+                if result["supported"]:
+                    data = poster_frame(path, result, cancel)
+                    if data and not cancel.is_set():
+                        self.events.poster.emit(seq, data)
             except Exception as exc:
-                if "result" not in locals():
+                if "result" not in locals() and not cancel.is_set():
                     self.events.inspected.emit(seq, None, str(exc))
+            finally:
+                self.events.inspection_done.emit(cancel)
 
         threading.Thread(target=read, daemon=True).start()
+
+    def inspection_done(self, cancel):
+        self.inspections.discard(cancel)
+        if self.close_after and not self.inspections and not self.busy:
+            self.close()
 
     def got_poster(self, seq, data):
         if seq != self.seq:
@@ -642,7 +658,7 @@ class Studio(QMainWindow):
             self.suggest_dest()
 
     def start(self, *, sample=False):
-        if self.busy or not self.info or not self.info["supported"]:
+        if self.busy or self.close_after or not self.info or not self.info["supported"]:
             return
         # Recheck immediately before export in case another program took this name.
         # The engine also claims the final destination atomically after verification.
@@ -805,6 +821,8 @@ class Studio(QMainWindow):
         shell_path(Path(self.last_output).parent)
 
     def closeEvent(self, event):
+        for pending in self.inspections:
+            pending.set()
         if self.busy:
             event.ignore()
             if self.cancel_event.is_set():
@@ -825,6 +843,9 @@ class Studio(QMainWindow):
                     self.stop()
                 else:
                     event.accept()
+        elif self.inspections:
+            self.close_after = True
+            event.ignore()
         else:
             event.accept()
 

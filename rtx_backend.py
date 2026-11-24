@@ -1,7 +1,10 @@
 """Offline HDR processing through NVIDIA's native packed 10-bit VFX interface."""
 
+import base64
 import contextlib
+import csv
 import ctypes as ct
+import errno
 import hashlib
 import importlib
 import json
@@ -21,6 +24,7 @@ from ai import app_dir, nvenc_command
 WHEEL = "nvidia_vfx-0.2.0.0-cp312-abi3-win_amd64.whl"
 URL = "https://pypi.nvidia.com/nvidia-vfx/" + WHEEL
 SHA256 = "cebaa12411f7e22b39293205c5c4d07b8073d14ca1e0e7727ee4375207a36445"
+RECORD_SHA256 = "4e05af7a8e0e8e2744736119deeffa8e7b4f5fa510dd1f89f163e28eb0acb577"
 
 
 def sdk_cache():
@@ -34,52 +38,109 @@ def check_cancel():
         raise InterruptedError("已取消 RTX 处理。")
 
 
-def load_sdk(scratch=None):
-    target = sdk_cache()
-    if not target.joinpath("READY").is_file():
-        print("首次使用 RTX 超分，正在从 NVIDIA 下载并验证 VFX 运行库（416 MiB）…", flush=True)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # Keep the large download with this render's scratch so the GUI can
-        # clean it even if Windows has to force-stop the worker.
-        with tempfile.TemporaryDirectory(prefix="nvvfx-", dir=scratch or target.parent) as tmp:
-            tmp = Path(tmp)
-            wheel = tmp / WHEEL
-            digest = hashlib.sha256()
+def _valid_sdk(target):
+    marker = target / "READY"
+    record = target / "nvidia_vfx-0.2.0.0.dist-info" / "RECORD"
+    try:
+        if marker.read_bytes() != SHA256.encode("ascii"):
+            return False
+        contents = record.read_bytes()
+        if hashlib.sha256(contents).hexdigest() != RECORD_SHA256:
+            return False
+        # The wheel's pinned RECORD lists all shipped DLLs, models and Python modules.
+        for relative, checksum, size in csv.reader(contents.decode("utf-8").splitlines()):
+            check_cancel()
+            if not checksum:  # RECORD cannot contain its own hash.
+                continue
+            file = target / relative
+            if file.stat().st_size != int(size):
+                return False
+            with file.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").digest()
+            if base64.urlsafe_b64encode(digest).rstrip(b"=") != checksum[7:].encode("ascii"):
+                return False
+        return True
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+        return False
+
+
+@contextlib.contextmanager
+def _install_lock(target):
+    # Windows releases the byte-range lock even if a canceled worker is killed.
+    import msvcrt
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.with_name(target.name + ".install.lock").open("a+b") as lock:
+        lock.seek(0)
+        while True:
+            check_cancel()
             try:
-                with urllib.request.urlopen(URL, timeout=25) as response, wheel.open("wb") as out:
-                    while block := response.read(1 << 20):
-                        check_cancel()
-                        digest.update(block)
-                        out.write(block)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                break
             except OSError as exc:
-                if isinstance(exc, InterruptedError):
+                if exc.errno != errno.EACCES:
                     raise
-                raise RuntimeError(f"NVIDIA VFX 下载失败，请检查网络或代理后重试。{exc}") from exc
-            if digest.hexdigest() != SHA256:
-                raise RuntimeError("NVIDIA VFX 文件校验失败，请重新运行。")
-            staged = tmp / "sdk"
+                time.sleep(0.15)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def _install_sdk(target, scratch):
+    print("正在从 NVIDIA 下载并验证 VFX 运行库（416 MiB）…", flush=True)
+    # Stage the install on the cache volume. The verified wheel may be downloaded
+    # to the movie's scratch volume, which also handles cross-drive installations.
+    with tempfile.TemporaryDirectory(prefix="nvvfx-", dir=scratch or target.parent) as tmp:
+        wheel = Path(tmp) / WHEEL
+        digest = hashlib.sha256()
+        try:
+            with urllib.request.urlopen(URL, timeout=25) as response, wheel.open("wb") as out:
+                while block := response.read(1 << 20):
+                    check_cancel()
+                    digest.update(block)
+                    out.write(block)
+        except OSError as exc:
+            if isinstance(exc, InterruptedError) or exc.errno == errno.ENOSPC:
+                raise
+            raise RuntimeError(f"NVIDIA VFX 下载失败，请检查网络或代理后重试。{exc}") from exc
+        if digest.hexdigest() != SHA256:
+            raise RuntimeError("NVIDIA VFX 文件校验失败，请重新运行。")
+        with tempfile.TemporaryDirectory(prefix=target.name + "-stage-", dir=target.parent) as folder:
+            staged = Path(folder) / "new"
             with zipfile.ZipFile(wheel) as archive:
                 for member in archive.infolist():
                     check_cancel()
-                    archive.extract(member, staged)
+                    path = staged / member.filename
+                    if member.is_dir():
+                        path.mkdir(parents=True, exist_ok=True)
+                        continue
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(member) as data, path.open("xb") as unpacked:
+                        while chunk := data.read(1 << 20):
+                            check_cancel()
+                            unpacked.write(chunk)
             (staged / "READY").write_text(SHA256, encoding="ascii")
+            check_cancel()
+            # Rename the old cache only once the replacement is complete.
+            old = Path(folder) / "previous"
+            if target.exists():
+                target.rename(old)
             try:
                 staged.rename(target)
-            except OSError as exc:
-                if not target.joinpath("READY").is_file():
-                    # When the movie and platform cache use different drives,
-                    # copy to the cache's filesystem before the atomic rename.
-                    if getattr(exc, "winerror", None) != 17:
-                        raise
-                    with tempfile.TemporaryDirectory(prefix="stage-", dir=target.parent) as transit:
-                        copy = Path(transit) / "sdk"
-                        shutil.copytree(staged, copy)
-                        check_cancel()
-                        try:
-                            copy.rename(target)
-                        except OSError:
-                            if not target.joinpath("READY").is_file():
-                                raise
+            except OSError:
+                if old.exists():
+                    old.rename(target)
+                raise
+
+
+def load_sdk(scratch=None):
+    target = sdk_cache()
+    if not _valid_sdk(target):
+        with _install_lock(target):
+            if not _valid_sdk(target):
+                _install_sdk(target, scratch)
     sys.path.insert(0, str(target))
     return importlib.import_module("nvvfx"), target / "nvvfx" / "libs"
 

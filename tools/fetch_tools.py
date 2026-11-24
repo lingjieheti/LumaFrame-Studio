@@ -144,7 +144,7 @@ def fetch(pkg, cache):
         temporary = Path(name)
         try:
             print(f"Downloading {pkg.url}", flush=True)
-            request = Request(pkg.url, headers={"User-Agent": "LumaFrameStudio/1.1.1"})
+            request = Request(pkg.url, headers={"User-Agent": "LumaFrameStudio/1.1.2"})
             with os.fdopen(fd, "wb") as output, urlopen(request, timeout=60) as response:
                 shutil.copyfileobj(response, output, length=1024 * 1024)
             actual = digest(temporary)

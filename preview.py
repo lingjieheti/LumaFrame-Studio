@@ -21,9 +21,9 @@ def render_sample(source, destination, mode, progress, cancel, *, target, durati
         if split:
             initial_maps += ["-map", f"0:{source_data['_p7_el']}"]
             excerpt_maps += ["-map", "0:V:1"]
-        # MOV-family Dolby streams often carry the dvh1 sample entry. Keep that
-        # container during the copy so the P5 configuration survives intact.
-        mov = Path(source).suffix.lower() in {".mp4", ".m4v", ".mov"} and not split
+        # Preserve MOV sample entries and per-track timescales until the BL/EL
+        # comparison. An interim Matroska copy would round PTS to milliseconds.
+        mov = "mov" in source_data.get("format", {}).get("format_name", "").split(",")
         suffix = ".mp4" if mov else ".mkv"
         nearby = Path(work) / ("nearby" + suffix)
         excerpt = Path(work) / ("excerpt" + suffix)
@@ -87,7 +87,7 @@ def render_sample(source, destination, mode, progress, cancel, *, target, durati
             import profile7
             import dovi
 
-            bl_times = engine._times(excerpt, 0, run, coded_order=True)
+            bl_times, video_end = engine._times(excerpt, 0, run, coded_order=True, with_end=True)
             el_times = engine._times(excerpt, 1, run, coded_order=True)
             if len(bl_times) != len(el_times) or any(
                 abs(a - b) > 2 for a, b in zip(bl_times, el_times)
@@ -110,13 +110,17 @@ def render_sample(source, destination, mode, progress, cancel, *, target, durati
             dovi._run(run, "mux", "--bl", bl, "--el", el, "-o", joined)
             timing = dirpath / "timecodes.txt"
             ordered = sorted(bl_times)
+            if video_end is not None:
+                ordered.append(video_end)
             timing.write_text(
                 "# timestamp format v2\n"
                 + "".join(f"{(pts - ordered[0]) / 1000:.3f}\n" for pts in ordered),
                 encoding="ascii",
             )
             excerpt = dirpath / "verified-input.mkv"
-            rate = primary.get("avg_frame_rate") or primary["r_frame_rate"]
+            rate = engine._ratio(primary.get("avg_frame_rate")) or engine._ratio(primary.get("r_frame_rate"))
+            if rate <= 0:
+                raise ValueError("无法读取双轨试片的帧率。")
             run(
                 [
                     engine._tool("mkvmerge"),
@@ -128,7 +132,7 @@ def render_sample(source, destination, mode, progress, cancel, *, target, durati
                     "--timestamps",
                     "0:" + str(timing),
                     "--default-duration",
-                    "0:" + rate + "fps",
+                    f"0:{rate}fps",
                     joined,
                 ]
             )
