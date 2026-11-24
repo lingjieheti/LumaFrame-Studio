@@ -323,7 +323,7 @@ def decoder_input(params, hidden):
     probe = subprocess.check_output(
         [
             bundled_tool("ffprobe"), "-v", "error", "-select_streams", "V:0", "-show_entries",
-            "stream=width,height,avg_frame_rate,r_frame_rate,color_range,pix_fmt:"
+            "stream=width,height,avg_frame_rate,r_frame_rate,color_range,pix_fmt,color_space,color_transfer,color_primaries:"
             "stream_side_data=dv_profile,dv_bl_signal_compatibility_id",
             "-of", "json", src,
         ],
@@ -364,11 +364,12 @@ def run_worker(params):
     if iw >= w and ih >= h:
         raise ValueError("RTX 超分需要至少一个方向的画面尺寸放大。")
     compressed = params.get("compressed_source", False)
-    if compressed and not any(
-        side.get("dv_profile") == 8 and side.get("dv_bl_signal_compatibility_id") == 1
-        for side in stream.get("side_data_list", [])
-    ):
-        raise ValueError("压缩片源修复需要 HDR10 兼容的 Dolby Vision Profile 8.1 输入。")
+    if compressed:
+        config = [s for s in stream.get("side_data_list", []) if "dv_profile" in s]
+        if (any(s.get("dv_profile") != 8 or s.get("dv_bl_signal_compatibility_id") != 1 for s in config)
+                or (stream.get("color_space"), stream.get("color_transfer"), stream.get("color_primaries"),
+                    stream.get("color_range")) != ("bt2020nc", "smpte2084", "bt2020", "tv")):
+            raise ValueError("压缩片源修复需要有限范围 HDR10 或 HDR10 兼容的 Dolby Vision Profile 8.1。")
     nvvfx, libs = load_sdk(Path(params["output"]).resolve().parent)
     ffmpeg = [bundled_tool("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error"]
     # RGB10A2 expects red in bits 0..9. FFmpeg calls exactly that layout x2bgr10le.

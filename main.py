@@ -57,12 +57,13 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QSpinBox,
 )
 import glass
 from glass import ASSETS, GlassButton, Material, Rail, Stage, Select, ink
 from material_sample import MaterialSample
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 REPO = "https://github.com/lingjieheti/LumaFrame-Studio"
 SPONSOR = "https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md"
 TARGETS = {
@@ -81,6 +82,27 @@ MODES = {
 }
 ROOT = Path(__file__).resolve().parent
 HIDE = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def centered_margins(width, height, ratio):
+    """Choose symmetric, even pixel insets close to the requested display ratio."""
+    if width / height < ratio:
+        inset = max(0, 2 * round((height - width / ratio) / 4))
+        return 0, 0, inset, inset
+    inset = max(0, 2 * round((width - height * ratio) / 4))
+    return inset, inset, 0, 0
+
+
+def output_targets(info):
+    if info.get("can_keep7"):
+        return ["keep7", "preserve"]
+    if info["source_type"] == "dv":
+        return ["preserve"]
+    if info["source_type"] == "hdr10" and (info["width"], info["height"]) == (
+        info["target_width"], info["target_height"]
+    ):
+        return ["newdv"]
+    return ["hdr10", "newdv"]
 
 
 def label(text, kind=""):
@@ -367,6 +389,42 @@ class Studio(QMainWindow):
         mapping_layout.addWidget(mapping_label)
         mapping_layout.addWidget(self.sdr_mapping, 1)
         cg.addWidget(self.mapping_row)
+        self.area_panel = QWidget()
+        area_layout = layout(QVBoxLayout, self.area_panel, 0, 6)
+        area_row = layout(QHBoxLayout, None, 0, 12)
+        area_label = label("亮度分析区域", "field")
+        self.area_choice = Select()
+        area_label.setBuddy(self.area_choice)
+        self.area_choice.setAccessibleName("亮度分析区域")
+        self.area_choice.setToolTip("按输出画幅排除固定黑边，成片保留完整画布。可变画幅请使用完整画幅。")
+        self.area_choice.addItem("完整画幅", "full")
+        for name, ratio in (("1.85∶1", 1.85), ("2.35∶1", 2.35), ("2.39∶1", 2.39), ("4∶3", 4 / 3)):
+            self.area_choice.addItem(name + " · 居中有效画面", ratio)
+        self.area_choice.addItem("自定四边 · 成片像素", "custom")
+        area_row.addWidget(area_label)
+        area_row.addWidget(self.area_choice, 1)
+        area_layout.addLayout(area_row)
+        self.area_custom = QWidget()
+        custom_row = layout(QHBoxLayout, self.area_custom, 0, 5)
+        self.margin_inputs = []
+        for direction in ("左", "右", "上", "下"):
+            field = QSpinBox()
+            field.setRange(0, 4095)
+            field.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+            field.setAccessibleName(direction + "边距，成片像素")
+            field.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            cap = label(direction, "field")
+            cap.setBuddy(field)
+            custom_row.addWidget(cap)
+            custom_row.addWidget(field, 1)
+            self.margin_inputs.append(field)
+        area_layout.addWidget(self.area_custom)
+        self.area_custom.hide()
+        self.area_panel.hide()
+        self.area_choice.currentIndexChanged.connect(
+            lambda: self.area_custom.setVisible(self.area_choice.currentData() == "custom")
+        )
+        cg.addWidget(self.area_panel)
         out = layout(QVBoxLayout, None, 0, 6)
         pb = layout(QHBoxLayout, None, 0, 8)
         self.path = QLineEdit()
@@ -639,11 +697,11 @@ class Studio(QMainWindow):
         QFrame#card {{background:{card};border:1px solid {edge};border-radius:20px;}}
         QFrame#rule {{background:{edge};border:0;}}
         QFrame#actions {{background:transparent;border:0;border-top:1px solid {edge};}}
-        QLineEdit,QComboBox {{background:{field_bg};padding:7px 12px;border-radius:10px;border:1px solid {edge};min-height:20px;}}
+        QLineEdit,QComboBox,QSpinBox {{background:{field_bg};padding:7px 12px;border-radius:10px;border:1px solid {edge};min-height:20px;}}
         QComboBox {{padding-right:28px;}}
         QComboBox:disabled {{color:{mut};}}
-        QComboBox:enabled:hover,QLineEdit:hover {{border-color:{mut};}}
-        QComboBox:focus,QLineEdit:focus {{border:2px solid {accent};padding:6px 11px;}}
+        QComboBox:enabled:hover,QLineEdit:hover,QSpinBox:hover {{border-color:{mut};}}
+        QComboBox:focus,QLineEdit:focus,QSpinBox:focus {{border:2px solid {accent};padding:6px 11px;}}
         QComboBox:focus {{padding-right:27px;}}
         QComboBox::drop-down {{border:0;width:26px;background:transparent;}}
         QComboBox::down-arrow {{width:0;height:0;}}
@@ -668,7 +726,8 @@ class Studio(QMainWindow):
             QWidget.update(w)
 
     def set_controls(self, enabled):
-        for w in (self.renderbtn, self.previewbtn, self.browse, self.targets, self.modes, self.sdr_mapping):
+        for w in (self.renderbtn, self.previewbtn, self.browse, self.targets, self.modes, self.sdr_mapping,
+                  self.area_panel):
             w.setEnabled(enabled)
 
     def choose(self):
@@ -746,6 +805,10 @@ class Studio(QMainWindow):
     def got_info(self, seq, info, err):
         if seq != self.seq:
             return
+        self.area_panel.hide()
+        self.area_choice.setCurrentIndex(0)
+        for field in self.margin_inputs:
+            field.setValue(0)
         self.info = info
         self.status.show()
         if err:
@@ -772,13 +835,12 @@ class Studio(QMainWindow):
         info = self.info or {}
         self.mapping_row.setVisible(bool(info.get("supported") and info.get("source_type") == "sdr"))
         if not info.get("supported"):
+            self.area_panel.hide()
             self.targets.blockSignals(False)
             self.modes.clear()
             self.hint.hide()
             return
-        keys = {"sdr": ["hdr10", "newdv"], "hdr10": ["newdv"]}.get(info.get("source_type"), ["preserve"])
-        if info.get("can_keep7"):
-            keys.insert(0, "keep7")
+        keys = output_targets(info)
         for key in keys:
             caption = TARGETS[key]
             if key == "preserve" and info.get("dv_profile") in (5, 7):
@@ -790,6 +852,7 @@ class Studio(QMainWindow):
 
     def target_change(self, *_):
         k = self.targets.currentData()
+        self.area_panel.setVisible(k in {"hdr10", "newdv"})
         self.modes.blockSignals(True)
         self.modes.clear()
         keys = (
@@ -808,11 +871,13 @@ class Studio(QMainWindow):
                 keys = [key for key in keys if key != "neural"]
             if ratio <= 1.0:
                 keys = ["reference"]
-            elif k == "preserve" and self.info.get("dv_profile") == 8:
+            elif (k == "preserve" and self.info.get("dv_profile") == 8) or self.info.get("source_type") == "hdr10":
                 keys.insert(1, "rtx_compressed")
             if k == "preserve" and self.info.get("can_copy8"):
                 keys.insert(0, "copy")
-            if self.info.get("source_type") == "hdr10":
+            if self.info.get("source_type") == "hdr10" and (self.info["width"], self.info["height"]) == (
+                self.info["target_width"], self.info["target_height"]
+            ):
                 keys = ["copy"]
         for key in keys:
             name = MODES[key]
@@ -823,7 +888,7 @@ class Studio(QMainWindow):
             elif (k == "preserve" and key == "reference" and self.info.get("can_keep7")
                   and self.info.get("profile", "").endswith(" · MEL")):
                 name = "保留原始基础层 · 转换杜比元数据"
-            elif key == "reference" and k in ("hdr10", "newdv"):
+            elif key == "reference" and self.info.get("source_type") == "sdr":
                 name = "Spline36 · 高位深扩展"
             self.modes.addItem(name, key)
         self.modes.setCurrentIndex(0)
@@ -838,7 +903,7 @@ class Studio(QMainWindow):
             "rtx": "10 位 AI 超分与高码率编码，适合优质电影片源。首次使用需下载约 416 MiB 的 NVIDIA 运行库。",
             "rtx_compressed": "适合有压缩噪声的片源。轻度时空降噪后进行 RTX 超分。颗粒和文件大小可能变化，可先试转。",
             "neural": "使用 NVIDIA GPU 增强亮度细节，以 x265 慢速 CRF 14 编码。",
-            "reference": "使用高位深 Spline36 与 x265 慢速编码，适合保留胶片纹理。",
+            "reference": "使用高位深 Spline36 与 x265 慢速编码。画面有移动细纹、织物或胶片纹理时，可先试转比较。",
             "quality": "采用 NVIDIA Image Scaling 与硬件编码，适合快速导出。",
         }
         text = tips.get(key, "")
@@ -851,7 +916,7 @@ class Studio(QMainWindow):
                 text = "全片确认为 MEL 时，沿用原始 HEVC 基础层，并将逐帧杜比元数据转换为 Profile 8.1。"
             if "FEL" in self.info.get("profile", ""):
                 text += " 重建的 12 位画面逐帧送入后续处理，请为分层码流和成片封装预留磁盘空间。"
-        elif self.info and self.info.get("source_type") == "hdr10":
+        elif self.info and self.info.get("source_type") == "hdr10" and key == "copy":
             text = "沿用原始 HDR10 画面和母版亮度，逐镜测量生成杜比动态元数据。"
         elif self.targets.currentData() == "newdv":
             text += " 按新画面测量生成杜比动态元数据。"
@@ -897,6 +962,19 @@ class Studio(QMainWindow):
         mode = self.modes.currentData()
         target = self.targets.currentData()
         mapping = self.sdr_mapping.currentData() if self.info["source_type"] == "sdr" else "expand"
+        active_area = None
+        choice = self.area_choice.currentData()
+        if target in {"hdr10", "newdv"} and choice != "full":
+            import dovi
+            canvas = self.info["target_width"], self.info["target_height"]
+            margins = (tuple(f.value() for f in self.margin_inputs) if choice == "custom"
+                       else centered_margins(*canvas, choice))
+            try:
+                active_area = dovi.validate_active_area(margins, *canvas)
+            except ValueError as exc:
+                self.status.setText(str(exc))
+                self.status.show()
+                return
         self.busy = True
         self.cancel_event = threading.Event()
         self.started_at = time.monotonic()
@@ -929,10 +1007,12 @@ class Studio(QMainWindow):
                         target=target,
                         duration=self.info["duration"],
                         sdr_mapping=mapping,
+                        active_area=active_area,
                     )
                 else:
                     res = engine.render(
-                        src, dest, mode, self.events.state.emit, self.cancel_event, target=target, sdr_mapping=mapping
+                        src, dest, mode, self.events.state.emit, self.cancel_event, target=target,
+                        sdr_mapping=mapping, active_area=active_area,
                     )
                 self.events.complete.emit(res, "")
             except Exception as exc:
@@ -1111,6 +1191,8 @@ def export_command(argv):
     parser.add_argument("--sdr-mapping", choices=("expand", "reference"), default="expand",
                         help="SDR only: expand highlights to 1000 nits or map SDR white to 203 nits")
     parser.add_argument("--sample", action="store_true")
+    parser.add_argument("--active-area", type=int, nargs=4, metavar=("LEFT", "RIGHT", "TOP", "BOTTOM"),
+                        help="New HDR10 or Dolby Vision: fixed analysis insets in output pixels, keeping the full canvas")
     options = parser.parse_args(argv)
     result_file = Path(options.result)
     try:
@@ -1124,12 +1206,10 @@ def export_command(argv):
                 if not data["supported"]:
                     raise ValueError(data["reason"])
                 if not options.target:
-                    options.target = "keep7" if data.get("can_keep7") else {
-                        "sdr": "hdr10", "hdr10": "newdv"
-                    }.get(data["source_type"], "preserve")
+                    options.target = output_targets(data)[0]
                 if not options.mode:
                     native = (data["width"], data["height"]) == (data["target_width"], data["target_height"])
-                    if data["source_type"] == "hdr10" or (options.target == "preserve" and data.get("can_copy8")):
+                    if (data["source_type"] == "hdr10" and native) or (options.target == "preserve" and data.get("can_copy8")):
                         options.mode = "copy"
                     else:
                         options.mode = "reference" if native else "rtx"
@@ -1145,6 +1225,7 @@ def export_command(argv):
                     target=options.target,
                     duration=data["duration"],
                     sdr_mapping=options.sdr_mapping,
+                    active_area=options.active_area,
                 )
             else:
                 result = engine.render(
@@ -1155,6 +1236,7 @@ def export_command(argv):
                     threading.Event(),
                     target=options.target,
                     sdr_mapping=options.sdr_mapping,
+                    active_area=options.active_area,
                 )
             json.dump(result, report, ensure_ascii=False, indent=2)
             return 0

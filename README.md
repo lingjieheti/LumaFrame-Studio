@@ -4,7 +4,7 @@
 
 [从官网下载](https://www.lingjie.cyou/projects/lumaframe-studio/) · [GitHub Releases](https://github.com/lingjieheti/LumaFrame-Studio/releases/latest) · [超分实测](docs/quality.md) · [双层画质验证](docs/profile7.md) · [赞助作者](https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md)
 
-**1.4.0 画质验证** 有明显压缩痕迹的 1080p Profile 8.1 可以试用「压缩片源修复」。干净片源继续使用默认高码率 Ultra。符合条件的原生 4K HDR10 可在保留编码画面的同时生成杜比动态元数据。[1.4.0 画质与验证](docs/quality-1.4.md) · [1.3.0 的 HDR 母版对照](docs/quality-1.3.md)
+**1.4.1 画质验证** 低于目标尺寸的静态 HDR10 可直接超分至 4K HDR10 或杜比视界。新编码的 HDR10 和杜比文件按最终画面实测 MaxCLL/MaxFALL，支持指定电影黑边。新制杜比改进了低对比剪辑识别。[片源和实测](docs/quality-1.4.1.md) · [跨方案与运动压力测试](docs/coverage-1.4.1.md) · [压缩片源修复](docs/compressed-1.4.md)
 
 ![LumaFrame Studio 浅色工作台](docs/workspace-light.png)
 
@@ -28,12 +28,13 @@
 | 单层 HEVC Dolby Vision Profile 8.1 | Dolby Vision Profile 8.1 | 保留原动态元数据，按输出尺寸调整逐镜有效画面区域 |
 | 单层 HEVC Dolby Vision Profile 5 | Dolby Vision Profile 8.1 | 先重建 Profile 5 画面，再生成 HDR10 兼容基础层并转换原杜比元数据 |
 | 已达目标画幅的静态 HDR10 HEVC Main 10 | Dolby Vision Profile 8.1 | 保留原始编码画面，沿用 ST 2086 母版亮度，逐镜生成新元数据 |
+| 需要放大的静态 HDR10 HEVC Main 10 | 4K HDR10 或 Dolby Vision Profile 8.1 | 直接超分 BT.2020/PQ，支持高码率 RTX、压缩修复、FSRCNNX、Spline36 |
 | 普通 BT.709 SDR | HDR10 | 重建 BT.2020/PQ 画面，自动扩展高光，目标峰值 1000 尼特 |
 | 普通 BT.709 SDR | Dolby Vision Profile 8.1 | 先制作 HDR 画面，再估算各镜头亮度并生成新的动态元数据 |
 
 双层输入支持单轨交织的 HEVC 视频，以及明确标注基础轨与增强轨依赖关系的双视频轨 MP4。RTX、FSRCNNX 和参考模式均可直接接收合成后的 12 位画面，省去整片的无损临时视频。完整 FEL 合成需要支持 AVX2 的 x64 处理器；双层原样保留可以直接复制。混合 MEL/FEL 的原生 4K 片源可使用原样保留模式。双层播放器、电视与容器支持影响最终播放效果。[双层验证与适用范围](docs/profile7.md)
 
-自动制作的杜比视界反映软件对 SDR 素材的映射。电影中已剪掉的高光或已丢失的细节无法从原片确认。Profile 8.4、隔行视频和需要旋转矩阵的片源会提示不支持。部分无色彩标记的高清视频按照 BT.709 解释，并在界面提示。常规超分按原画幅适配 3840 × 2160。宽银幕电影可以输出例如 3840 × 1600；已经是 3840 至 4096 像素宽的合规 4K 片源可以保持原尺寸。
+新制作 HDR10 或杜比时，固定黑边电影可在「亮度分析区域」选择已知的居中画幅，或填写最终画布的左、右、上、下像素边距。命令行使用 `--target newdv --active-area 0 0 276 276` 可排除上下各 276 个输出像素参与分析，保留完整编码画面。自动元数据描述新输出，原片中已剪掉的高光或已丢失的细节无法从原片确认。Profile 8.4、隔行视频和需要旋转矩阵的片源会提示不支持。部分无色彩标记的高清视频按照 BT.709 解释，并在界面提示。常规超分按原画幅适配 3840 × 2160。宽银幕电影可输出例如 3840 × 1600，已达目标尺寸的合规 4K 原片可按所选路径保留原尺寸。
 
 整片导出会复制兼容的原音轨、字幕、章节和附件。请在目标磁盘预留足够的临时空间，长片处理中会同时存在视频裸流和已封装的成片。界面遇到同名文件会自动编号，试转后会保留为整片选择的文件名。命令行遇到同名文件会停止。项目已在 RTX 5080 上测试，实际编码用时与片源复杂度、CPU、GPU 和显存有关。HDR / 杜比映射的最终观感需在相应设备上确认。
 

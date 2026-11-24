@@ -168,7 +168,7 @@ def layers(base, enhancement, expected, width, height, ffprobe, run):
         raise ValueError("基础层与增强层尺寸或逐帧数量不匹配。")
 
 
-def run_pipe(upstream, downstream, run, work):
+def run_pipe(upstream, downstream, run, work, *, failure="双层 HEVC 流式拆分失败。"):
     """Pipe the Annex B byte stream without buffering a film in RAM or on disk."""
     cancel = getattr(run, "cancel", None)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -210,7 +210,7 @@ def run_pipe(upstream, downstream, run, work):
                             if status is not None:
                                 label += f" ({status})"
                             messages.append(f"{label} {detail}".rstrip())
-                    raise RuntimeError("双层 HEVC 流式拆分失败。\n" + "\n".join(messages))
+                    raise RuntimeError(failure + "\n" + "\n".join(messages))
                 if statuses == (0, 0):
                     return
                 time.sleep(0.05)

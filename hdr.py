@@ -60,7 +60,44 @@ def _scene(start, length, minimum, maximum, total):
     }
 
 
-def measure_output(base_file, work_dir, run):
+def _shot_starts(marks, levels):
+    """Keep scdet hard cuts and recover isolated weaker changes in shot brightness."""
+    means = memoryview(levels)[2::3]
+    differences = array("f")
+    cuts = set()
+    index = -1
+    with marks.open(encoding="utf-8", errors="replace") as src:
+        for line in src:
+            if line.startswith("frame:"):
+                index = int(line[6:].split()[0])
+                if index != len(differences):
+                    raise ValueError("分镜检测的帧序号不连续。")
+            elif line.startswith("lavfi.scd.mafd="):
+                differences.append(float(line.split("=", 1)[1]))
+            elif line.startswith("lavfi.scd.time="):
+                cuts.add(index)
+    if len(differences) != len(means):
+        raise ValueError("分镜检测和亮度测量的帧数不同。")
+    for i in range(3, len(means) - 3):
+        change = differences[i]
+        if change < 4 or i in cuts:
+            continue
+        # Compare with motion before AND after the edit. A second reverse
+        # transition up to three frames later should not promote a brief flash.
+        motion_before = sum(differences[i - 3:i]) / 3
+        motion_after = sum(differences[i + 1:i + 4]) / 3
+        if change < 4 * max(motion_before, motion_after):
+            continue
+        # Compare shot means on both sides. Motion that merely relocates a
+        # pattern may change RGB differences sharply while leaving L1 stable.
+        mean_before = (means[i - 2] + means[i - 1]) * 0.5
+        mean_after = (means[i] + means[i + 1]) * 0.5
+        if abs(mean_after - mean_before) >= 0.02 * 65535:
+            cuts.add(i)
+    return sorted(cuts)
+
+
+def measure_output(base_file, work_dir, run, *, active_area=None):
     exe = ROOT / "bin" / "ffmpeg.exe"
     ffmpeg = str(exe) if exe.exists() else shutil.which("ffmpeg")
     if not ffmpeg:
@@ -106,24 +143,34 @@ def measure_output(base_file, work_dir, run):
 
     with tempfile.TemporaryDirectory(dir=work_dir, prefix="scene_cuts_") as folder:
         marks = Path(folder) / "cuts.txt"
+        graph_options = []
         # scdet uses only luma on planar YUV. A compact RGB picture makes
         # abrupt isoluminant colour edits measurable without another 4K copy.
         # Pad each end so the centred three-frame median keeps the original
         # frame numbers. Only the cut detector suppresses isolated flashes.
-        detector = (
-            "[0:v:0]split[measure][detect];[detect]"
+        source = "[0:v:0]"
+        if active_area and any(active_area):
+            left, right, top, bottom = active_area
+            # Chroma taps must see neighbouring rows across FFmpeg's slice boundaries.
+            graph_options = ["-filter_complex_threads", "1"]
+            # Reconstruct full-resolution PQ chroma before cropping at the
+            # exact luma-pixel offset, including odd 4:2:0 boundaries.
+            source += ("zscale=filter=spline36:matrixin=2020_ncl:rangein=limited:matrix=gbr:range=full,"
+                       f"format=gbrp16le,crop=w=iw-{left}-{right}:h=ih-{top}-{bottom}:x={left}:y={top}:exact=1,")
+        detector = source + (
+            "split[measure][detect];[detect]"
             "scale=w=min(iw\\,320):h=min(ih\\,180):force_original_aspect_ratio=decrease:"
             "flags=area:in_color_matrix=bt2020:out_range=full,"
             "format=gbrp,tpad=start=1:stop=1:start_mode=clone:stop_mode=clone,"
             "tmedian=radius=1,format=rgb24,scdet=threshold=8,"
-            "metadata=mode=print:key=lavfi.scd.time:file="
+            "metadata=mode=print:file="
             + filter_path(marks) + ",nullsink;"
         )
-        run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", *init,
+        run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", *init, *graph_options,
              "-i", str(base_file), "-filter_complex", detector + vf, "-map", "[out]",
              "-an", "-sn", "-f", "null", "-"], parse_line, collect=False)
         accept()
-        cuts = [int(n) for n in re.findall(r"^frame:(\d+)", marks.read_text(), re.MULTILINE)]
+        cuts = _shot_starts(marks, levels)
     frames = len(levels) // 3
     if not frames:
         raise ValueError("没有可分析的输出画面。")

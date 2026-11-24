@@ -51,6 +51,43 @@ class ExportWindowTests(unittest.TestCase):
         self.assertEqual(self.window.modes.currentData(), "copy")
         self.assertTrue(self.window.mapping_row.isHidden())
 
+    def test_static_hdr10_upscale_and_new_dolby_area_apply_to_the_selected_source(self):
+        window = self.window
+        source = dict(window.info, width=1920, height=1080, can_keep7=False, dv_profile=None, source_type="hdr10")
+        window.got_info(0, source, "")
+        self.assertEqual(window.targets.currentData(), "hdr10")
+        self.assertEqual(window.modes.currentData(), "rtx")
+        self.assertGreater(window.modes.findData("rtx_compressed"), 0)
+        self.assertFalse(window.area_panel.isHidden())
+        self.assertTrue(window.mapping_row.isHidden())
+        window.area_choice.setCurrentIndex(window.area_choice.findData(2.35))
+        with patch("preview.render_sample", side_effect=ValueError("test finished")) as hdr_sample:
+            window.start(sample=True)
+            self.wait_for_result()
+        self.assertEqual(hdr_sample.call_args.kwargs["active_area"], (0, 0, 262, 262))
+        window.targets.setCurrentIndex(window.targets.findData("newdv"))
+        self.assertFalse(window.area_panel.isHidden())
+        window.area_choice.setCurrentIndex(window.area_choice.findData(2.39))
+        with patch("preview.render_sample", side_effect=ValueError("test finished")) as sample:
+            window.start(sample=True)
+            self.wait_for_result()
+        self.assertEqual(sample.call_args.kwargs["active_area"], (0, 0, 276, 276))
+        window.area_choice.setCurrentIndex(window.area_choice.findData("custom"))
+        for field, value in zip(window.margin_inputs, (9, 20, 25, 30)):
+            field.setValue(value)
+        with patch("engine.render", side_effect=ValueError("test finished")) as render:
+            window.start()
+            self.wait_for_result()
+        self.assertEqual(render.call_args.kwargs["active_area"], (9, 20, 25, 30))
+        window.margin_inputs[1].setValue(3840)
+        with patch("engine.render") as render:
+            window.start()
+            self.assertFalse(window.busy)
+            render.assert_not_called()
+        window.got_info(0, dict(source, path="other.mkv"), "")
+        self.assertEqual(window.area_choice.currentData(), "full")
+        self.assertTrue(all(f.value() == 0 for f in window.margin_inputs))
+
     def test_compression_repair_is_optional_for_smaller_profile8_sources(self):
         info = dict(self.window.info, dv_profile=8, width=1920, height=1080, can_keep7=False)
         self.window.got_info(0, info, "")

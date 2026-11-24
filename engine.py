@@ -278,8 +278,8 @@ def _describe(path, data):
             if (v.get("codec_name") != "hevc" or v.get("profile") != "Main 10" or v.get("pix_fmt") != "yuv420p10le"
                     or (v.get("color_primaries"), v.get("color_space"), v.get("color_range"))
                     != ("bt2020", "bt2020nc", "tv") or sar != 1
-                    or (w, h) != (target_w, target_h) or w > 3840):
-                raise ValueError("HDR10 原画面制作需要已达目标尺寸的 HEVC Main 10、方形像素、有限范围 BT.2020/PQ 片源。")
+                    or w > 3840):
+                raise ValueError("HDR10 需要 HEVC Main 10、方形像素、有限范围 BT.2020/PQ，画宽上限为 3840。")
             info.update(source_type="hdr10", profile="HDR10 · 静态 PQ")
         else:
             p = v.get("pix_fmt", "")
@@ -577,7 +577,7 @@ def _gpu_command(source, output, info, mode, target, rpu, master, cll, *, fel_in
         max_bitrate=cap if mode == "rtx" else min(60000, cap),
         mastering=master, max_cll=cll,
         hw_decode=min(info["width"], info["height"]) >= 128,
-        sdr_to_hdr=target != "preserve",
+        sdr_to_hdr=info.get("source_type") == "sdr",
         sdr_mapping=info.get("sdr_mapping", "expand"),
         fel_input=fel_input,
         compressed_source=info.get("compressed_source", False),
@@ -592,10 +592,10 @@ def _software_command(source, out, info, video, mode, target, master, cll):
         init_args, vf = decode_profile5_filter(
             info["width"], info["height"], w, h, neural=mode == "neural"
         )
-    elif target == "preserve" and mode == "reference":
+    elif (target == "preserve" or info.get("source_type") == "hdr10") and mode == "reference":
         dither = "error_diffusion" if info.get("enhancement_layer") == "FEL" else "none"
         init_args, vf = [], f"zscale=w={w}:h={h}:filter=spline36:dither={dither},format=yuv420p10le"
-    elif target == "preserve":
+    elif target == "preserve" or info.get("source_type") == "hdr10":
         from neural import ff_filter
 
         init_args, vf = ff_filter(info["width"], info["height"], w, h)
@@ -611,6 +611,8 @@ def _software_command(source, out, info, video, mode, target, master, cll):
             + ":colorspace=bt709:color_primaries=bt709:color_trc=bt709,"
             + vf
         )
+    if info.get("source_type") == "hdr10":
+        vf += ",sidedata=mode=delete:type=CONTENT_LIGHT_LEVEL"
     params = [
         "hdr10=1",
         "hdr10-opt=1",
@@ -911,7 +913,8 @@ def _verify_other(source, output, original, result, chapter_streams, explicit_ch
             raise ValueError("章节名称校验失败。")
 
 
-def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_mapping="expand"):
+def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_mapping="expand",
+           active_area=None):
     source = Path(path).resolve(strict=True)
     before = source.stat()
     dest = Path(destination).resolve()
@@ -932,17 +935,24 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
     info = _inspect(source, data, run, sample_layers=False)
     if not info["supported"]:
         raise ValueError(info["reason"])
+    if active_area is not None and target not in {"hdr10", "newdv"}:
+        raise ValueError("分析边距仅用于新制作的 HDR10 或杜比视界。")
+    canvas = info["target_width"], info["target_height"]
+    offsets = dovi.validate_active_area(active_area, *canvas)
+    area_options = {"active_area": offsets, "canvas": canvas} if active_area is not None else {}
+    is_hdr10 = info["source_type"] == "hdr10"
+    same_size = (info["width"], info["height"]) == canvas
     if mode == "rtx_compressed":
-        if (info["dv_profile"] != 8 or target != "preserve" or
-                (info["width"], info["height"]) == (info["target_width"], info["target_height"])):
-            raise ValueError("压缩片源修复仅适用于需要放大的 Dolby Vision Profile 8.1。")
+        compatible = (info["dv_profile"] == 8 and target == "preserve") or (is_hdr10 and target in {"hdr10", "newdv"})
+        if not compatible or same_size:
+            raise ValueError("压缩片源修复仅适用于需要放大的静态 HDR10 或 Dolby Vision Profile 8.1。")
         info["compressed_source"] = True
         mode = "rtx"
     if sdr_mapping not in {"expand", "reference"} or (sdr_mapping != "expand" and info["source_type"] != "sdr"):
         raise ValueError("亮度映射仅适用于 SDR 片源，请选择有效的映射方式。")
     info["sdr_mapping"] = sdr_mapping
     native = target == "keep7"
-    author_native = info["source_type"] == "hdr10"
+    author_native = is_hdr10 and same_size
     if author_native and (mode != "copy" or target != "newdv"):
         raise ValueError("原生 HDR10 请选择生成杜比视界并保留原始编码画面。")
     copy_video = mode == "copy" and not author_native
@@ -954,7 +964,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
         mode = "reference"
     if (target in {"preserve", "keep7"}) != (info["source_type"] == "dv"):
         raise ValueError(
-            "杜比视界保留需要 Profile 5、7 或 8.1 片源；HDR10 与新杜比视界制作需要 SDR 片源。"
+            "保留杜比需要 Profile 5、7 或 8.1。生成 HDR10 或新杜比视界请选择 BT.709 SDR 或静态 HDR10 片源。"
         )
     if mode == "quality" and info["dv_profile"] in {5, 7}:
         raise ValueError(
@@ -1024,19 +1034,28 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
         picture_signature = None
         base_layer_copied = False
         generation_levels = {}
-        if author_native:
+        measured_levels = None
+        if is_hdr10:
             from hdr10 import NativeMetadata
             from profile7 import signature
 
             progress(5, "读取原始 HDR10 编码画面与母版显示信息")
-            _extract(source, video["index"], encoded, run)
+            original_es = encoded if author_native else scratch / "original-hdr10.hevc"
+            _extract(source, video["index"], original_es, run)
             metadata = NativeMetadata()
-            picture_signature = signature(encoded, cancel, inspect_unit=metadata.observe)
-            if picture_signature[0] != len(times):
+            source_signature = signature(original_es, cancel, inspect_unit=metadata.observe)
+            if source_signature[0] != len(times):
                 raise ValueError("HDR10 基础层图像数与显示时间戳数不符。")
             generation_levels = metadata.level6()
             master, cll = _static_hdr(source, video, run)
-            base_layer_copied = streamed = True
+            if author_native:
+                picture_signature = source_signature
+                base_layer_copied = streamed = True
+            else:
+                original_es.unlink()
+                # Source CLL/FALL describe the original pixels. A resize can
+                # change both. Do not advertise them as measured output values.
+                cll = None
         elif info["dv_profile"] == 7:
             import profile7
 
@@ -1217,12 +1236,25 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
             )
         if picture != source:
             picture.unlink()
+        if info["source_type"] == "sdr" or (is_hdr10 and not author_native):
+            from hdr10 import measure_content_light, write_content_light
+
+            progress(72, "逐帧测量最终编码画面的 MaxCLL 和 MaxFALL")
+            measured_levels = measure_content_light(encoded, canvas, offsets, len(times), scratch, run)
+            signalled = scratch / "measured-light.hevc"
+            write_content_light(encoded, signalled, measured_levels, cancel)
+            encoded.unlink()
+            encoded = signalled
+            peak, frame_average = measured_levels
+            cll = f"{peak},{frame_average}"
+            generation_levels.update(max_cll=peak, max_fall=frame_average)
         if target == "newdv":
             from hdr import measure_output
 
             progress(73, "测量新 HDR 画面的逐镜亮度")
-            measurements = measure_output(encoded, scratch, run)
-            meta = dovi.generate_rpu_from_measurements(measurements, rpu, scratch, run, **generation_levels)
+            measurements = measure_output(encoded, scratch, run, active_area=offsets)
+            meta = dovi.generate_rpu_from_measurements(measurements, rpu, scratch, run,
+                                                       **generation_levels, **area_options)
             if meta["frame_count"] != len(times):
                 raise ValueError("新生成的 RPU 帧数与原视频不一致。")
         if target not in {"hdr10", "keep7"} and not has_rpu and not copy_video:
@@ -1291,7 +1323,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
             raise ValueError("输出视频的末帧显示时长与原片不一致。")
         out_master, out_cll = _static_hdr(muxed, out_video, run)
         if (master and master != out_master) or (cll and cll != out_cll):
-            raise ValueError("输出静态 HDR 母版或亮度元数据未保留。")
+            raise ValueError("成片中的静态 HDR 母版或内容亮度与预期不符。")
         _verify_other(
             data, out_data, original, _mkv_inventory(muxed, run), chapter_streams,
             bool(chapter_file), source, muxed, run,
@@ -1349,7 +1381,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
                 if signature(readback, cancel, ignore_rpu=base_layer_copied) != picture_signature:
                     raise ValueError("无损封装后的 HEVC 编码画面、参数集或附加数据发生变化。")
             progress(95, "逐帧复核最终文件内的 RPU")
-            verification = dovi.verify_rpu(rpu, muxed, scratch, run)
+            verification = dovi.verify_rpu(rpu, muxed, scratch, run, **area_options)
             digest = verification["rpu_sha256"]
         _check_cancel(cancel)
         after = source.stat()
@@ -1388,8 +1420,12 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
             result.update(base_layer_copied=True, bl_sha256=picture_signature[1])
         if copy_video and picture_signature:
             result["video_sha256"] = picture_signature[1]
+        if measured_levels is not None:
+            result["measured_content_light"] = dict(max_cll_nits=peak, max_fall_nits=frame_average)
         if info["source_type"] == "sdr":
             result["sdr_mapping"] = sdr_mapping
+        if target in {"hdr10", "newdv"}:
+            result["active_area"] = dict(zip(("left", "right", "top", "bottom"), offsets))
         if container_digest:
             result["container_sha256"] = container_digest
     progress(100, "导出与校验均已完成")

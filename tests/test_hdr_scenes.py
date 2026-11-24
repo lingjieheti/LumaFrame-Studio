@@ -1,6 +1,7 @@
 """Validate authored shot boundaries in the RPU read back from the HEVC."""
 import json
 import os
+from array import array
 from pathlib import Path
 import struct
 import subprocess
@@ -10,6 +11,27 @@ import unittest
 import dovi
 import engine
 import hdr
+
+
+class AdaptiveShotStartTests(unittest.TestCase):
+    def test_weak_transitions_need_local_contrast_and_a_sustained_pq_change(self):
+        def starts(differences, means):
+            with tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / "cuts.txt"
+                path.write_text("".join(f"frame:{i}  pts:{i}\nlavfi.scd.mafd={v}\n"
+                                        for i, v in enumerate(differences)), "utf-8")
+                levels = array("d", (v for mean in means for v in (mean, mean, mean)))
+                return hdr._shot_starts(path, levels)
+
+        self.assertEqual(starts([0]*5 + [5.47] + [0]*5, [8000]*5 + [11700]*6), [5])
+        # A short flash has two nearby peaks; camera motion has little effect
+        # on frame-average MaxRGB despite a pronounced RGB difference.
+        self.assertEqual(starts([0]*5 + [6.25, 0, 6.25] + [0]*4,
+                                [19000]*5 + [22500]*2 + [19000]*5), [])
+        self.assertEqual(starts([0]*5 + [6.25, 0, 0, 6.25] + [0]*4,
+                                [19000]*5 + [22500]*3 + [19000]*5), [])
+        self.assertEqual(starts([0]*5 + [6.78] + [0]*5, [30000]*5 + [30100]*6), [])
+        self.assertEqual(starts([0]*3 + [4]*8, [10000 + 3000*i for i in range(11)]), [])
 
 
 @unittest.skipUnless(os.environ.get("LUMAFRAME_TEST_VULKAN") == "1",

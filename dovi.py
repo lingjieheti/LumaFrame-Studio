@@ -100,15 +100,26 @@ def _export_area(rpu, target, run):
 _SIDES = ("left", "right", "top", "bottom")
 
 
+def validate_active_area(offsets, width, height):
+    """Return L5 pixel insets in left/right/top/bottom order for this raster."""
+    if type(width) is not int or type(height) is not int or min(width, height) < 1:
+        raise ValueError("有效画面需要已知的正整数画布尺寸。")
+    if offsets is None:
+        return (0, 0, 0, 0)
+    if (not isinstance(offsets, (tuple, list)) or len(offsets) != 4
+            or any(type(v) is not int or not 0 <= v <= 8191 for v in offsets)):
+        raise ValueError("有效画面需要左、右、上、下四个 0 至 8191 的整数像素偏移。")
+    left, right, top, bottom = offsets
+    if left + right >= width or top + bottom >= height:
+        raise ValueError("L5 有效画面偏移超出实际画布。")
+    return tuple(offsets)
+
+
 def _area_intervals(area, width, height, count):
-    presets = {p["id"]: tuple(p[k] for k in _SIDES) for p in area.get("presets", [])}
-    for offsets in presets.values():
-        if (
-            any(type(v) is not int or v < 0 or v > 8191 for v in offsets)
-            or offsets[0] + offsets[1] >= width
-            or offsets[2] + offsets[3] >= height
-        ):
-            raise ValueError("L5 有效画面偏移超出实际画布。")
+    presets = {
+        p["id"]: validate_active_area(tuple(p[k] for k in _SIDES), width, height)
+        for p in area.get("presets", [])
+    }
     intervals = []
     for frames, preset in area.get("edits", {}).items():
         a, sep, b = frames.partition("-")
@@ -210,7 +221,15 @@ def inject_rpu(encoded_hevc, rpu, final_hevc, run):
     _run(run, "inject-rpu", "-i", encoded_hevc, "-r", rpu, "-o", final_hevc)
 
 
-def verify_rpu(source_prepared, encoded_elementary, work_dir, run):
+def _verify_authored_area(rpu, folder, active_area, canvas, count, run):
+    """Ensure the final read-back describes the requested fixed area for every frame."""
+    offsets = validate_active_area(active_area, *canvas)
+    area = _export_area(rpu, Path(folder) / "authored-l5.json", run)
+    if _area_intervals(area, *canvas, count) != [(0, count - 1, offsets)]:
+        raise ValueError("写入的杜比 L5 有效画面与指定像素范围不一致。")
+
+
+def verify_rpu(source_prepared, encoded_elementary, work_dir, run, *, active_area=None, canvas=None):
     """Read back the HEVC or single-video Matroska output in display order, including every block."""
     with tempfile.TemporaryDirectory(dir=work_dir, prefix="dovi_verify_") as folder:
         copy = Path(folder) / "readback.rpu"
@@ -221,6 +240,10 @@ def verify_rpu(source_prepared, encoded_elementary, work_dir, run):
             source_prepared
         ):
             raise ValueError("成品中逐帧提取的 Dolby Vision RPU 与计划写入的数据不一致。")
+        if active_area is not None:
+            if not canvas:
+                raise ValueError("核验指定的有效画面时需要给出输出画布尺寸。")
+            _verify_authored_area(copy, folder, active_area, canvas, count, run)
     return {"verified": True, "frame_count": count, "rpu_sha256": checksum}
 
 
@@ -234,6 +257,8 @@ def generate_rpu_from_measurements(
     max_fall=None,
     mastering_max=1000,
     mastering_min=1,
+    active_area=None,
+    canvas=None,
 ):
     """Create open-source CM 2.9 P8.1 metadata from measurements in 12-bit PQ code values.
 
@@ -265,6 +290,11 @@ def generate_rpu_from_measurements(
     if any(type(x) is not int or not 0 <= x <= 65535 for x in level6.values()):
         raise ValueError("L6 亮度字段超出 16-bit 合法范围。")
     cfg = {"cm_version": "V29", "profile": "8.1", "length": count, "shots": shots, "level6": level6}
+    if active_area is not None:
+        if not canvas:
+            raise ValueError("写入指定的有效画面时需要给出输出画布尺寸。")
+        offsets = validate_active_area(active_area, *canvas)
+        cfg["level5"] = {f"active_area_{side}_offset": v for side, v in zip(_SIDES, offsets)}
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=work, prefix="dovi_generate_") as folder:
@@ -274,6 +304,8 @@ def generate_rpu_from_measurements(
         _run(run, "generate", "-j", config, "-o", generated)
         if _count_profile8(generated, run) != count:
             raise ValueError("生成的杜比视界帧数与测量帧数不一致。")
+        if active_area is not None:
+            _verify_authored_area(generated, folder, offsets, canvas, count, run)
         shutil.copyfile(generated, rpu_out)
     return {
         "rpu_path": str(rpu_out),
