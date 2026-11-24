@@ -16,6 +16,14 @@ def nvenc_exe():
     return app_dir() / "bin" / "nvenc" / "NVEncC64.exe"
 
 
+def rtx_status(line):
+    if line == "status=download_vfx":
+        return "正在从 NVIDIA 下载并验证 VFX 运行库（416 MiB）…"
+    if line.startswith("NVIDIA RTX Video"):
+        return line[:140]
+    return None
+
+
 def nvenc_command(
     source,
     output,

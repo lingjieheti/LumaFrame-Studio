@@ -89,7 +89,7 @@ def _install_lock(target):
 
 
 def _install_sdk(target, scratch):
-    print("正在从 NVIDIA 下载并验证 VFX 运行库（416 MiB）…", flush=True)
+    print("status=download_vfx", flush=True)
     # Stage the install on the cache volume. The verified wheel may be downloaded
     # to the movie's scratch volume, which also handles cross-drive installations.
     with tempfile.TemporaryDirectory(prefix="nvvfx-", dir=scratch or target.parent) as tmp:

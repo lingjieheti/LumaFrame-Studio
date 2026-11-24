@@ -1116,11 +1116,14 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
         if native:
             progress(74, "已保留原始双层视频")
         elif not streamed and (has_rpu or mode == "rtx"):
+            from ai import rtx_status
+
             cmd = _gpu_command(picture, encoded, info, mode, target, rpu, master, cll)
 
             def nv_progress(line):
-                if "VFX" in line or "NVIDIA 下载" in line:
-                    progress(12, line[:140])
+                status = rtx_status(line)
+                if status:
+                    progress(12, status)
                 if line.startswith("progress_frame=") and line[15:].isdigit():
                     current = int(line[15:])
                     progress(

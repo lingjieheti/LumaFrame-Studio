@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+from ai import rtx_status
 
 
 # Evaluated by the separately distributed, isolated VapourSynth interpreter (bin/fel).
@@ -291,8 +292,8 @@ def bake(
                     break
                 if rtx:
                     for line in codec_status.readlines(8192):
-                        message = line.decode("utf-8", "replace").strip()
-                        if "VFX 运行库" in message or message.startswith("NVIDIA RTX Video"):
+                        message = rtx_status(line.decode("utf-8", "replace").strip())
+                        if message:
                             progress(first, message)
                 for line in status.readlines():
                     if line.startswith(b"frame=") and line[6:].strip().isdigit():
