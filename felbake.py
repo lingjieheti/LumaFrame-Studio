@@ -4,6 +4,7 @@ import json
 import hashlib
 import ctypes
 import errno
+import os
 from fractions import Fraction
 from pathlib import Path
 import shutil
@@ -123,6 +124,25 @@ def _stop(process):
         process.wait()
 
 
+_PQ12_COLOR = [
+    "-color_primaries", "bt2020", "-color_trc", "smpte2084",
+    "-colorspace", "bt2020nc", "-color_range", "tv", "-chroma_sample_location", "topleft",
+]
+
+
+def pq12_input_args(width, height, rate):
+    return [
+        "-f", "rawvideo", "-pixel_format", "yuv420p12le", "-video_size", f"{width}x{height}",
+        "-framerate", str(rate), *_PQ12_COLOR,
+    ]
+
+
+def _log_tail(path, size=2300):
+    with path.open("rb") as stream:
+        stream.seek(max(0, path.stat().st_size - size))
+        return stream.read(size).decode("utf-8", "replace")
+
+
 def bake(
     bl_hevc,
     el_hevc,
@@ -160,37 +180,24 @@ def bake(
         encoding="utf-8",
     )
     script.write_text(_SCRIPT, encoding="utf-8")
-    color = [
-        "-color_primaries",
-        "bt2020",
-        "-color_trc",
-        "smpte2084",
-        "-colorspace",
-        "bt2020nc",
-        "-color_range",
-        "tv",
-        "-chroma_sample_location",
-        "topleft",
-    ]
-    raw = [
-        "-f",
-        "rawvideo",
-        "-pixel_format",
-        "yuv420p12le",
-        "-video_size",
-        f"{width}x{height}",
-        "-framerate",
-        str(rate),
-        *color,
-    ]
+    raw = pq12_input_args(width, height, rate)
     direct = encoder_command is not None
+    rtx = direct and "--rtx-worker" in encoder_command
     if direct:
         encode = [str(item) for item in encoder_command]
-        if encode.count("-i") != 1 or encode[encode.index("-i") + 1 :][:1] != ["pipe:0"]:
-            raise ValueError("FEL 编码器必须从一个标准输入管道读取画面。")
-        pos = encode.index("-i")
-        encode[pos:pos] = raw
-        output = (work / encode[-1]).resolve()
+        if rtx:
+            params = json.loads(encode[-1])
+            if params.get("source") != "pipe:0" or params.get("fel_input") != {
+                "width": width, "height": height, "fps": str(rate),
+            } or not params.get("rpu"):
+                raise ValueError("RTX 管道的合成画幅、帧率或杜比元数据参数不完整。")
+            output = (work / params["output"]).resolve()
+        else:
+            if encode.count("-i") != 1 or encode[encode.index("-i") + 1 :][:1] != ["pipe:0"]:
+                raise ValueError("FEL 编码器必须从一个标准输入管道读取画面。")
+            pos = encode.index("-i")
+            encode[pos:pos] = raw
+            output = (work / encode[-1]).resolve()
         if output.parent != work or output.suffix.lower() not in {".hevc", ".h265", ".265"}:
             raise ValueError("FEL 编码器必须在任务目录内生成 HEVC 裸流。")
         first, span = 12, 60
@@ -223,7 +230,7 @@ def bake(
             "8",
             "-slicecrc",
             "1",
-            *color,
+            *_PQ12_COLOR,
             str(output),
         ]
         first, span = 6, 5
@@ -233,13 +240,15 @@ def bake(
     cancel = getattr(run, "cancel", None)
     _check_cancel(cancel)
     diagnostic = work / "fel-compose.log"
-    codec_log = work / "fel-lossless.log"
+    codec_log = work / "fel-encoder.log"
+    worker_env = dict(os.environ, CINEMA_RTX_CANCEL=str(work / "cancel.rtx")) if rtx else None
     producer = consumer = None
     try:
         with (
             diagnostic.open("wb") as dl,
             codec_log.open("wb") as cl,
             diagnostic.open("rb") as status,
+            codec_log.open("rb") as codec_status,
         ):
             producer = subprocess.Popen(
                 [str(_runtime()), "-I", str(script), str(config)],
@@ -254,16 +263,22 @@ def bake(
                     encode,
                     cwd=work,
                     stdin=producer.stdout,
-                    stdout=subprocess.DEVNULL,
+                    stdout=cl if rtx else subprocess.DEVNULL,
                     stderr=cl,
+                    env=worker_env,
                     **common,
                 )
             finally:
                 producer.stdout.close()
             while producer.poll() is None or consumer.poll() is None:
                 _check_cancel(cancel)
-                if consumer.poll() not in (None, 0):
+                if consumer.poll() not in (None, 0) or producer.poll() not in (None, 0):
                     break
+                if rtx:
+                    for line in codec_status.readlines(8192):
+                        message = line.decode("utf-8", "replace").strip()
+                        if message.startswith(("首次使用 RTX", "NVIDIA RTX Video")):
+                            progress(first, message)
                 for line in status.readlines():
                     if line.startswith(b"frame=") and line[6:].strip().isdigit():
                         completed = int(line[6:])
@@ -274,9 +289,7 @@ def bake(
                         )
                 time.sleep(0.1)
         if producer.poll() != 0 or consumer.poll() != 0:
-            details = "\n".join(
-                p.read_bytes()[-2300:].decode("utf-8", "replace") for p in (diagnostic, codec_log)
-            )
+            details = "\n".join(_log_tail(p) for p in (diagnostic, codec_log))
             if (
                 any(
                     term in details.lower()
@@ -296,8 +309,22 @@ def bake(
                 )
             raise ValueError(f"双层 Dolby Vision 合成失败。\n{details.strip()}")
     finally:
-        _stop(consumer)
+        if rtx and consumer is not None and consumer.poll() is None:
+            (work / "cancel.rtx").touch()
         _stop(producer)
+        if rtx and consumer is not None and consumer.poll() is None:
+            # Closing the producer unblocks a decoder waiting for another frame.
+            # Let the worker join its codec processes and release their file handles
+            # before the caller removes the scratch directory on Windows.
+            try:
+                consumer.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                subprocess.run(
+                    ["taskkill", "/PID", str(consumer.pid), "/T", "/F"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    **common,
+                )
+        _stop(consumer)
     probe = json.loads(
         run(
             [
@@ -325,8 +352,9 @@ def bake(
     }
     if not direct:
         expected.update(width=width, height=height, chroma_location="topleft")
-    if any(probe.get(k) != v for k, v in expected.items()) or any(
-        "dv_profile" in sd for sd in probe.get("side_data_list", [])
-    ):
+    # The RTX encoder inserts the supplied RPU. Raw HEVC need not expose a
+    # container DV configuration here; render verifies it and the RPU after mux.
+    unexpected_dv = not rtx and any("dv_profile" in sd for sd in probe.get("side_data_list", []))
+    if any(probe.get(k) != v for k, v in expected.items()) or unexpected_dv:
         raise ValueError("双层合成输出的帧数、位深、色彩或轨道配置校验失败。")
     return output

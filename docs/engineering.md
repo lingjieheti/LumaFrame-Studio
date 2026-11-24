@@ -15,7 +15,7 @@
 
 Profile 7 的 BL 和 EL 分别携带基础画面和增强信息。dovi_tool 能抽取、拆分、转换和回填 RPU；FEL 的像素重建还需把两层解码后交给合成器。我们比较了 AviSynth+ DoViBaker、VapourSynth FelBaker、FFmpeg 的 dovi_split 和 mpv/libplacebo 的 FEL 播放路径。1.1 版在当前 Windows 编码链使用 FelBaker 及其固定版本参考向量。保留原生双层时直接复制并验证压缩数据，可避免重新量化。[DoViBaker](https://github.com/erazortt/DoViBaker) · [FelBaker](https://github.com/bbeny123/felbaker/tree/1.0.0) · [dovi_split 的职责](https://ffmpeg.org/ffmpeg-bitstream-filters.html#dovi_005fsplit) · [mpv FEL 实现](https://github.com/mpv-player/mpv/pull/17932) · [项目实测](profile7.md)
 
-原版 Dolby Vision 的 RPU 携带和帧关联的重塑或显示管理参数。P5 的基础图像需要按其色彩表示重建。已是 HDR10 兼容的 P8.1 则避免重复应用杜比映射。分镜黑边按新的像素尺寸调整，成片的原始 HEVC 流抽取后再次检查。自动制作的新杜比视界通过软件估算新画面的镜头亮度，再生成 Profile 8.1 元数据；估算精度、映射假设和实际测试记录见验证报告。[FFmpeg libplacebo](https://ffmpeg.org/ffmpeg-filters.html#libplacebo) · [dovi_tool](https://github.com/quietvoid/dovi_tool) · [验证记录](dolby-validation.md)
+原版 Dolby Vision 的 RPU 携带和帧关联的重塑或显示管理参数。P5 的基础图像需要按其色彩表示重建。已是 HDR10 兼容的 P8.1 则避免重复应用杜比映射。分镜黑边按新的像素尺寸调整，从封装后的 MKV 再次提取动态元数据并校验。自动制作的新杜比视界通过软件估算新画面的镜头亮度，再生成 Profile 8.1 元数据；估算精度、映射假设和实际测试记录见验证报告。[FFmpeg libplacebo](https://ffmpeg.org/ffmpeg-filters.html#libplacebo) · [dovi_tool](https://github.com/quietvoid/dovi_tool) · [验证记录](dolby-validation.md)
 
 ## 界面
 

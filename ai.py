@@ -1,6 +1,7 @@
 """HEVC Main10 encode commands for the HDR10-compatible Dolby Vision base layer."""
 
 import json
+from fractions import Fraction
 from pathlib import Path
 import sys
 
@@ -29,6 +30,7 @@ def nvenc_command(
     max_cll=None,
     hw_decode=True,
     sdr_to_hdr=False,
+    fel_input=None,
 ):
     """Return argv. `source` is a verified limited-range BT.2020/PQ main layer."""
     width, height = int(width), int(height)
@@ -52,6 +54,14 @@ def nvenc_command(
             max_cll=max_cll,
             sdr_to_hdr=sdr_to_hdr,
         )
+        if fel_input is not None:
+            iw, ih, fps = fel_input
+            if source != "pipe:0" or sdr_to_hdr or min(iw, ih) < 2 or iw % 2 or ih % 2:
+                raise ValueError("FEL 流式输入需要偶数尺寸的 PQ12 画面。")
+            rate = Fraction(fps)
+            if rate <= 0:
+                raise ValueError("FEL 流式输入需要正帧率。")
+            payload["fel_input"] = {"width": int(iw), "height": int(ih), "fps": str(rate)}
         prefix = (
             [sys.executable]
             if getattr(sys, "frozen", False)
@@ -118,6 +128,9 @@ def nvenc_command(
 def rtx_worker(argv):
     from rtx_backend import run_worker
 
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     return run_worker(json.loads(argv[0]))
 
 

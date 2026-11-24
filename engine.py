@@ -1,5 +1,6 @@
 """Frame-accurate HEVC/HDR rendering and verified Matroska delivery."""
 
+import hashlib
 import json
 import os
 import queue
@@ -9,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections import Counter
+from collections import Counter, deque
 from fractions import Fraction
 from pathlib import Path
 
@@ -42,7 +43,7 @@ class _Runner:
         self.cancel = cancel
         self.worker_cancel = None
 
-    def __call__(self, args, line_callback=None):
+    def __call__(self, args, line_callback=None, *, collect=True):
         _check_cancel(self.cancel)
         args = [str(item) for item in args]
         if (
@@ -75,7 +76,7 @@ class _Runner:
 
         reader = threading.Thread(target=read_output, daemon=True)
         reader.start()
-        lines = []
+        lines = [] if collect else deque(maxlen=32)
         try:
             while True:
                 _check_cancel(self.cancel)
@@ -344,7 +345,17 @@ def inspect_source(path):
 
 def _times(path, index, run, *, coded_order=False):
     # Packet PTS is in presentation order after sorting, even with B-frame reordering.
-    value = run(
+    times = []
+
+    def packet(line):
+        token = line.partition(",")[0].strip()
+        if not token:
+            return
+        if not re.fullmatch(r"-?\d+(\.\d+)?", token):
+            raise ValueError("视频缺少可还原的显示时间戳。")
+        times.append(round(float(token) * 1_000_000))
+
+    run(
         [
             _tool("ffprobe"),
             "-v",
@@ -357,19 +368,15 @@ def _times(path, index, run, *, coded_order=False):
             "-of",
             "csv=p=0",
             path,
-        ]
+        ],
+        packet,
+        collect=False,
     )
-    times = []
-    for line in value.splitlines():
-        token = line.partition(",")[0].strip()
-        if not token:
-            continue
-        if not re.fullmatch(r"-?\d+(\.\d+)?", token):
-            raise ValueError("视频缺少可还原的显示时间戳。")
-        times.append(round(float(token) * 1_000_000))
     if not times or len(set(times)) != len(times):
         raise ValueError("视频显示时间戳为空或重复，无法保证逐帧同步。")
-    return times if coded_order else sorted(times)
+    if not coded_order:
+        times.sort()
+    return times
 
 
 def _static_hdr(path, video, run):
@@ -414,27 +421,31 @@ def _static_hdr(path, video, run):
     return master, cll
 
 
-def _extract(source, video_index, dest, run, *, limit=None):
-    run(
-        [
-            _tool("ffmpeg"),
-            "-nostdin",
-            "-v",
-            "error",
-            "-i",
-            source,
-            "-map",
-            f"0:{video_index}",
-            *(["-frames:v", str(limit)] if limit else []),
-            "-c:v",
-            "copy",
-            "-bsf:v",
-            "hevc_mp4toannexb",
-            "-f",
-            "hevc",
-            dest,
-        ]
-    )
+def _extract(source, video_index, dest, run, *, limit=None, downstream=None):
+    args = [
+        _tool("ffmpeg"),
+        "-nostdin",
+        "-v",
+        "error",
+        "-i",
+        source,
+        "-map",
+        f"0:{video_index}",
+        *(["-frames:v", str(limit)] if limit else []),
+        "-c:v",
+        "copy",
+        "-bsf:v",
+        "hevc_mp4toannexb",
+        "-f",
+        "hevc",
+        dest,
+    ]
+    if downstream is None:
+        run(args)
+    else:
+        import profile7
+
+        profile7.run_pipe(args, downstream, run, Path(downstream[-1]).parent)
 
 
 def _vbv_limit(info):
@@ -496,6 +507,23 @@ def _check_dv_tier(path, video, config, cap, run):
     if video["width"] > width or cap > (high_rate if high else main_rate) * 1000:
         raise ValueError("输出信令的级别或档位与实际画宽、编码码率约束不符。")
     return ("High" if high else "Main"), level
+
+
+def _gpu_command(source, output, info, mode, target, rpu, master, cll, *, fel_input=None):
+    from ai import nvenc_command
+
+    cap = _vbv_limit(info)
+    return nvenc_command(
+        source, output, info["target_width"], info["target_height"],
+        rpu if target == "preserve" else None,
+        mode="rtx" if mode == "rtx" else "nis",
+        quality=15 if mode == "rtx" else 18,
+        max_bitrate=cap if mode == "rtx" else min(60000, cap),
+        mastering=master, max_cll=cll,
+        hw_decode=min(info["width"], info["height"]) >= 128,
+        sdr_to_hdr=target != "preserve",
+        fel_input=fel_input,
+    )
 
 
 def _software_command(source, out, info, video, mode, target, master, cll):
@@ -633,6 +661,25 @@ def _audio_starts(path, data, run):
     return result
 
 
+def _hash_container(path, cancel, progress, *, copy_to=None):
+    """Hash the copy as it is written, then independently hash the file read back."""
+    digest = hashlib.sha256()
+    size = path.stat().st_size
+    first, text = (84, "复制并校验原始 MKV") if copy_to else (95, "逐字节回读双层 MKV")
+    last = -1
+    with path.open("rb") as incoming:
+        while block := incoming.read(8 * 1024 * 1024):
+            _check_cancel(cancel)
+            if copy_to:
+                copy_to.write(block)
+            digest.update(block)
+            percent = first + int(4 * incoming.tell() / max(size, 1))
+            if percent != last:
+                progress(percent, text)
+                last = percent
+    return digest.hexdigest()
+
+
 def _mux(source, encoded, out, info, timing, original, run, audio_starts):
     video = [t for t in original["tracks"] if t["type"] == "video"][info.get("base_ordinal", 0)]
     props = video["properties"]
@@ -745,6 +792,7 @@ def _verify_other(source, output, original, result, common_offset):
 
 def render(path, destination, mode, progress, cancel, *, target="preserve"):
     source = Path(path).resolve(strict=True)
+    before = source.stat()
     dest = Path(destination).resolve()
     if dest == source or dest.exists():
         raise FileExistsError("目标文件已存在，请选择新的输出文件名。")
@@ -821,12 +869,14 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                 if s["codec_type"] == "video" and not s.get("disposition", {}).get("attached_pic")
             ]
             info["base_ordinal"] = video_tracks.index(video["index"])
-        times = sorted(coded_times)
+            del el_times
+        coded_times.sort()
+        times = coded_times
         timing = scratch / "timecodes.txt"
-        timing.write_text(
-            "# timestamp format v2\n" + "\n".join(f"{t / 1000:.3f}" for t in times) + "\n",
-            encoding="ascii",
-        )
+        if not copy_container:
+            with timing.open("w", encoding="ascii", newline="\n") as output_times:
+                output_times.write("# timestamp format v2\n")
+                output_times.writelines(f"{t / 1000:.3f}\n" for t in times)
         rpu = scratch / "scaled.rpu"
         encoded = scratch / "encoded.hevc"
         picture, picture_video = source, video
@@ -871,6 +921,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                     scratch,
                     run,
                     profile7_layer=layer,
+                    original_rpu=original_rpu,
                 )
                 if layer == "FEL":
                     from felbake import bake
@@ -879,13 +930,17 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                     dv_master, dv_cll = static_from_rpu(rpu, scratch, run, source_master=master)
                     master, cll = dv_master or master, dv_cll or cll
                     progress(8, "逐帧合成基础层与 FEL 残差")
-                    streamed = mode in {"reference", "neural"}
-                    command = None
-                    if streamed:
+                    streamed = True
+                    if mode == "rtx":
+                        command = _gpu_command(
+                            "pipe:0", encoded, info, mode, target, rpu, master, cll,
+                            fel_input=(info["width"], info["height"], info["fps"]),
+                        )
+                    else:
                         command = _software_command(
                             "pipe:0", encoded, info, {"index": 0}, mode, target, master, cll
                         )
-                    baked = bake(
+                    bake(
                         base,
                         el,
                         original_rpu,
@@ -898,8 +953,6 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                         progress,
                         encoder_command=command,
                     )
-                    if not streamed:
-                        picture = baked
                 else:
                     picture = scratch / "base.mkv"
                     run(
@@ -956,29 +1009,8 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
         has_rpu = target == "preserve" and mode in {"quality", "rtx"}
         if native:
             progress(74, "已保留原始双层视频")
-        elif has_rpu or mode == "rtx":
-            from ai import nvenc_command
-
-            sdr_args = dict(sdr_to_hdr=True) if target != "preserve" else {}
-            cap = _vbv_limit(info)
-            encoding = (
-                dict(quality=15, max_bitrate=cap)
-                if mode == "rtx"
-                else dict(max_bitrate=min(60000, cap))
-            )
-            cmd = nvenc_command(
-                picture,
-                encoded,
-                info["target_width"],
-                info["target_height"],
-                rpu if has_rpu else None,
-                mode="rtx" if mode == "rtx" else "nis",
-                mastering=master,
-                max_cll=cll,
-                hw_decode=min(info["width"], info["height"]) >= 128,
-                **sdr_args,
-                **encoding,
-            )
+        elif not streamed and (has_rpu or mode == "rtx"):
+            cmd = _gpu_command(picture, encoded, info, mode, target, rpu, master, cll)
 
             def nv_progress(line):
                 if "VFX" in line or "NVIDIA 下载" in line:
@@ -1020,13 +1052,10 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
         progress(84, "按原时间戳封装视频及原片轨道")
         muxed = scratch / "verified.mkv"
         starts = _audio_starts(source, data, run)
+        container_digest = None
         if copy_container:
-            with source.open("rb") as incoming, muxed.open("xb") as outgoing:
-                size = source.stat().st_size
-                while block := incoming.read(8 * 1024 * 1024):
-                    _check_cancel(cancel)
-                    outgoing.write(block)
-                    progress(84 + int(5 * incoming.tell() / size), "原样复制 Matroska 文件")
+            with muxed.open("xb") as outgoing:
+                container_digest = _hash_container(source, cancel, progress, copy_to=outgoing)
         else:
             _mux(source, encoded, muxed, info, timing, original, run, starts)
             encoded.unlink()
@@ -1083,7 +1112,11 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                     if abs(float(packet["pts_time"]) - valid[packet["data_hash"]]) > 0.003:
                         raise ValueError("封装后音轨相对视频发生时移。")
         digest = None
-        if native:
+        if copy_container:
+            if _hash_container(muxed, cancel, progress) != container_digest:
+                raise ValueError("双层 MKV 整文件 SHA-256 回读不一致。")
+            digest = dovi._digest(rpu)
+        elif native:
             progress(95, "逐层复核基础层、增强层和原始动态元数据")
             review = scratch / "readback"
             review.mkdir()
@@ -1109,11 +1142,14 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                 raise ValueError("成片 BL、EL 或原始 RPU 字节校验失败。")
         elif target != "hdr10":
             progress(95, "逐帧复核最终文件内的 RPU")
-            final_es = scratch / "final.hevc"
-            _extract(muxed, out_video["index"], final_es, run)
-            verification = dovi.verify_rpu(rpu, final_es, scratch, run)
+            verification = dovi.verify_rpu(rpu, muxed, scratch, run)
             digest = verification["rpu_sha256"]
         _check_cancel(cancel)
+        after = source.stat()
+        if (before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_ino, after.st_size, after.st_mtime_ns
+        ):
+            raise ValueError("片源在导出期间发生了变化，请重新导出。")
         if os.name == "nt":
             os.rename(muxed, dest)  # Atomic and fails if another job claimed the path.
         else:
@@ -1141,5 +1177,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
             )
         if signatures:
             result.update(bl_sha256=signatures[0][1], el_sha256=signatures[1][1])
+        if container_digest:
+            result["container_sha256"] = container_digest
     progress(100, "导出与校验均已完成")
     return result

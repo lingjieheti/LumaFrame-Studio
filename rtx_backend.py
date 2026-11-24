@@ -244,6 +244,32 @@ def read_frame(stream, frame):
     return True
 
 
+def decoder_input(params, hidden):
+    src = params["source"]
+    raw = params.get("fel_input")
+    if raw is not None:
+        from felbake import pq12_input_args
+
+        if src != "pipe:0" or params.get("sdr_to_hdr"):
+            raise ValueError("FEL 流式合成只支持从管道读入 PQ12。")
+        # The composer supplies the same PQ12 pixels and chroma siting used
+        # in its lossless file path. Probing a live pipe would consume frames.
+        stream = {
+            "width": raw["width"], "height": raw["height"], "avg_frame_rate": raw["fps"],
+            "color_range": "tv", "pix_fmt": "yuv420p12le",
+        }
+        return stream, [*pq12_input_args(raw["width"], raw["height"], raw["fps"]), "-i", src]
+    probe = subprocess.check_output(
+        [
+            bundled_tool("ffprobe"), "-v", "error", "-select_streams", "V:0", "-show_entries",
+            "stream=width,height,avg_frame_rate,r_frame_rate,color_range,pix_fmt:stream_side_data=dv_profile",
+            "-of", "json", src,
+        ],
+        creationflags=hidden,
+    )
+    return json.loads(probe)["streams"][0], ["-i", src]
+
+
 def run_worker(params):
     # Windows closes this handle on process exit. Explicitly closing it would
     # kill the worker itself before it can report the final encode status.
@@ -251,24 +277,8 @@ def run_worker(params):
     job.contain_current()
     hidden = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     env = os.environ.copy()
-    src = params["source"]
     w, h = params["width"], params["height"]
-    probe = subprocess.check_output(
-        [
-            bundled_tool("ffprobe"),
-            "-v",
-            "error",
-            "-select_streams",
-            "V:0",
-            "-show_entries",
-            "stream=width,height,avg_frame_rate,r_frame_rate,color_range,pix_fmt:stream_side_data=dv_profile",
-            "-of",
-            "json",
-            src,
-        ],
-        creationflags=hidden,
-    )
-    stream = json.loads(probe)["streams"][0]
+    stream, input_args = decoder_input(params, hidden)
     rate = stream.get("avg_frame_rate")
     if not rate or rate == "0/0":
         rate = stream["r_frame_rate"]
@@ -300,8 +310,7 @@ def run_worker(params):
         *ffmpeg,
         *init_args,
         "-noautorotate",
-        "-i",
-        src,
+        *input_args,
         "-map",
         "0:V:0",
         "-an",

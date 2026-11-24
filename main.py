@@ -22,6 +22,7 @@ if __name__ == "__main__" and sys.argv[1:2] == ["--rtx-worker"]:
 import json
 import subprocess
 import threading
+import time
 from datetime import datetime
 from fractions import Fraction
 from PySide6.QtCore import Qt, QSettings, Signal, QUrl, QTimer, QObject
@@ -55,7 +56,7 @@ from PySide6.QtWidgets import (
 )
 from glass import ASSETS, GlassButton, Material, Rail, Stage, Select
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 REPO = "https://github.com/lingjieheti/LumaFrame-Studio"
 SPONSOR = "https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md"
 TARGETS = {
@@ -96,6 +97,16 @@ def shell_path(path):
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
+def available_destination(path):
+    path = Path(path)
+    candidate = path
+    index = 2
+    while os.path.lexists(candidate):
+        candidate = path.with_name(f"{path.stem}-{index}{path.suffix}")
+        index += 1
+    return candidate
+
+
 class Events(QObject):
     inspected = Signal(int, object, str)
     poster = Signal(int, bytes)
@@ -117,6 +128,8 @@ class Studio(QMainWindow):
         self.setMinimumSize(820, 590)
         self.info = None
         self.busy = False
+        self.custom_destination = None
+        self.failure_detail = ""
         self.seq = 0
         self.cancel_event = threading.Event()
         self.events = Events(self)
@@ -124,6 +137,9 @@ class Studio(QMainWindow):
         self.events.poster.connect(self.got_poster)
         self.events.state.connect(self.update_progress)
         self.events.complete.connect(self.finished)
+        self.clock = QTimer(self)
+        self.clock.setInterval(1000)
+        self.clock.timeout.connect(self.show_progress)
         try:
             self.history = json.loads(str(self.settings.value("history", "[]")))[:20]
         except (ValueError, TypeError):
@@ -245,6 +261,11 @@ class Studio(QMainWindow):
         self.openbtn.clicked.connect(self.open_output)
         self.openbtn.hide()
         fh.addWidget(self.openbtn)
+        self.detailbtn = GlassButton("错误详情")
+        self.detailbtn.setFixedWidth(100)
+        self.detailbtn.clicked.connect(self.show_failure)
+        self.detailbtn.hide()
+        fh.addWidget(self.detailbtn)
         fh.addStretch()
         self.stopbtn = GlassButton("取消")
         self.stopbtn.setFixedWidth(82)
@@ -436,10 +457,12 @@ class Studio(QMainWindow):
         self.seq += 1
         seq = self.seq
         self.info = None
+        self.custom_destination = None
         self.show_page(0)
         self.set_controls(False)
         self.stage.set_poster(QPixmap())
         self.openbtn.hide()
+        self.detailbtn.hide()
         self.bar.hide()
         self.path.clear()
         self.film.setText(self.film.fontMetrics().elidedText(Path(path).name, Qt.ElideMiddle, 500))
@@ -475,7 +498,7 @@ class Studio(QMainWindow):
                         "-i",
                         path,
                         "-map",
-                        "0:v:0",
+                        "0:V:0",
                         "-frames:v",
                         "1",
                         "-vf",
@@ -520,11 +543,13 @@ class Studio(QMainWindow):
         )
         self.set_controls(info["supported"])
         self.refill_targets()
-        self.suggest_dest()
-        self.status.setText(
-            info["reason"]
-            or f"将导出 {info['target_width']} × {info['target_height']}，含 {info['audio_count']} 条音轨、{info['subtitle_count']} 条字幕。"
-        )
+        details = info["reason"]
+        if info["supported"]:
+            details = (
+                f"将导出 {info['target_width']} × {info['target_height']}，含 {info['audio_count']} 条音轨、"
+                f"{info['subtitle_count']} 条字幕。{details}"
+            )
+        self.status.setText(details)
 
     def refill_targets(self):
         self.targets.blockSignals(True)
@@ -585,8 +610,8 @@ class Studio(QMainWindow):
             text = "直接保留原始画质和逐帧杜比数据。此格式需要支持 Profile 7 的播放器。"
         elif self.info and self.info.get("dv_profile") == 7 and self.targets.currentData() == "preserve":
             text += " 导出前会读取增强层，生成 HDR10 兼容的单层 Profile 8.1。"
-            if key == "rtx" and "FEL" in self.info.get("profile", ""):
-                text += " RTX 会先写入 12 位无损中间文件，长片需要较大的临时空间。FSRCNNX 和 Spline36 可逐帧直接编码。"
+            if "FEL" in self.info.get("profile", ""):
+                text += " 重建的 12 位画面逐帧送入后续处理，请为分层码流和成片封装预留磁盘空间。"
         elif self.targets.currentData() == "newdv":
             text += " 按新画面测量生成杜比动态元数据。"
         self.hint.setText(text)
@@ -596,56 +621,54 @@ class Studio(QMainWindow):
             return
         src = Path(self.info["path"])
         dest = Path(self.settings.value("outputDir", str(src.parent)))
+        if not dest.is_dir():
+            dest = src.parent
         suffix = {"hdr10": "-4K-HDR10", "keep7": "-4K-DV-P7"}.get(self.targets.currentData(), "-4K-DV")
-        prefix = src.stem + suffix
-        f = dest / (prefix + ".mkv")
-        i = 2
-        while f.exists():
-            f = dest / (prefix + f"-{i}.mkv")
-            i += 1
+        f = available_destination(self.custom_destination or dest / (src.stem + suffix + ".mkv"))
         self.path.setText(str(f))
         self.path.setToolTip(str(f))
         self.path.setCursorPosition(0)
 
     def set_destination(self):
         f, _ = QFileDialog.getSaveFileName(
-            self, "保存 4K 影片", self.path.text(), "Matroska 影片 (*.mkv)"
+            self, "保存 4K 影片", self.path.text(), "Matroska 影片 (*.mkv)",
+            options=QFileDialog.Option.DontConfirmOverwrite,
         )
         if f:
             if not f.lower().endswith(".mkv"):
                 f += ".mkv"
-            self.path.setText(f)
-            self.path.setToolTip(f)
+            self.custom_destination = Path(f)
             self.settings.setValue("outputDir", str(Path(f).parent))
+            self.suggest_dest()
 
     def start(self, *, sample=False):
         if self.busy or not self.info or not self.info["supported"]:
             return
-        dest = self.path.text()
+        # Recheck immediately before export in case another program took this name.
+        # The engine also claims the final destination atomically after verification.
+        self.suggest_dest()
+        dest = Path(self.path.text())
         if sample:
-            p = Path(dest)
-            test = p.with_name(p.stem + "-试片.mkv")
-            index = 2
-            while test.exists():
-                test = p.with_name(p.stem + f"-试片-{index}.mkv")
-                index += 1
-            dest = str(test)
-        if Path(dest).exists():
-            QMessageBox.information(self, "选择新文件名", "目标文件已存在，请更改保存位置或文件名。")
-            return
+            dest = available_destination(dest.with_name(dest.stem + "-试片.mkv"))
+        dest = str(dest)
         src = self.info["path"]
         mode = self.modes.currentData()
         target = self.targets.currentData()
         self.busy = True
         self.cancel_event = threading.Event()
+        self.started_at = time.monotonic()
+        self.progress_value = 0
+        self.stage_message = "正在准备试片" if sample else "正在准备导出"
         self.set_controls(False)
         self.pick.setDisabled(True)
         self.stopbtn.setEnabled(True)
         self.stopbtn.show()
         self.openbtn.hide()
+        self.detailbtn.hide()
         self.bar.setValue(0)
         self.bar.show()
-        self.status.setText("正在准备导出")
+        self.show_progress()
+        self.clock.start()
 
         def run():
             try:
@@ -674,16 +697,31 @@ class Studio(QMainWindow):
         threading.Thread(target=run, daemon=True).start()
 
     def update_progress(self, n, msg):
-        self.bar.setValue(int(n))
-        self.status.setText(f"{n:.0f}%  ·  {msg}")
+        if not self.busy or self.cancel_event.is_set():
+            return
+        self.progress_value = max(self.progress_value, min(int(n), 100))
+        self.stage_message = msg
+        self.bar.setValue(self.progress_value)
+        self.show_progress()
+
+    def show_progress(self):
+        if self.busy:
+            elapsed = int(time.monotonic() - self.started_at)
+            minutes, seconds = divmod(elapsed, 60)
+            hours, minutes = divmod(minutes, 60)
+            self.status.setText(
+                f"{self.progress_value}%  ·  {self.stage_message}  ·  已用 {hours:02}:{minutes:02}:{seconds:02}"
+            )
 
     def stop(self):
         self.cancel_event.set()
         self.stopbtn.setEnabled(False)
-        self.status.setText("正在取消并清理临时文件…")
+        self.stage_message = "正在取消并清理临时文件…"
+        self.show_progress()
 
     def finished(self, res, err):
         self.busy = False
+        self.clock.stop()
         self.pick.setEnabled(True)
         self.set_controls(True)
         self.stopbtn.hide()
@@ -692,7 +730,8 @@ class Studio(QMainWindow):
             self.bar.setValue(100)
             self.openbtn.show()
             self.status.setText(
-                f"已完成并校验 {res['frame_count']:,} 帧   ·   {res['width']} × {res['height']}"
+                f"已校验 {res['frame_count']:,} 帧   ·   {res['width']} × {res['height']}   ·   "
+                + Path(self.last_output).name
             )
             self.history.insert(
                 0,
@@ -712,14 +751,20 @@ class Studio(QMainWindow):
             self.status.setText("导出已取消")
         else:
             self.bar.hide()
-            self.status.setText("导出未完成，请查看详情。")
-            box = QMessageBox(self)
-            box.setWindowTitle("导出未完成")
-            box.setText(err.strip().splitlines()[-1][:250] if err.strip() else "媒体处理失败")
-            box.setDetailedText(err[-12000:])
-            box.exec()
+            self.failure_detail = err.strip() or "媒体处理失败"
+            self.status.setText("导出未完成 · " + self.failure_detail.splitlines()[0][:250])
+            self.detailbtn.show()
         if getattr(self, "close_after", False):
             self.close()
+
+    def show_failure(self):
+        box = QMessageBox(self)
+        box.setAttribute(Qt.WA_DeleteOnClose)
+        box.setWindowTitle("导出未完成")
+        box.setTextFormat(Qt.PlainText)
+        box.setText(self.failure_detail.splitlines()[0][:250])
+        box.setDetailedText(self.failure_detail[-12000:])
+        box.open()
 
     def refresh_history(self):
         while self.history_list.count():
@@ -762,6 +807,9 @@ class Studio(QMainWindow):
     def closeEvent(self, event):
         if self.busy:
             event.ignore()
+            if self.cancel_event.is_set():
+                self.close_after = True
+                return
             if (
                 QMessageBox.question(
                     self,
@@ -772,8 +820,11 @@ class Studio(QMainWindow):
                 )
                 == QMessageBox.Yes
             ):
-                self.close_after = True
-                self.stop()
+                if self.busy:
+                    self.close_after = True
+                    self.stop()
+                else:
+                    event.accept()
         else:
             event.accept()
 

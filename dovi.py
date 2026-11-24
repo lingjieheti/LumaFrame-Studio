@@ -143,6 +143,7 @@ def prepare_rpu(
     *,
     _convert_profile5=False,
     profile7_layer=None,
+    original_rpu=None,
 ):
     """Extract RPU in presentation order; rescale active-area offsets on the same uncropped raster."""
     if min(source_width, source_height, out_width, out_height) <= 0:
@@ -157,9 +158,20 @@ def prepare_rpu(
         # and changes the color matrices after the picture has been reconstructed.
         if profile7_layer not in (None, "MEL", "FEL"):
             raise ValueError("未知的 Profile 7 增强层。")
-        mode = 3 if _convert_profile5 else {"FEL": 2, "MEL": 5}.get(profile7_layer)
-        args = ["-m", str(mode)] if mode else []
-        _run(run, *args, "extract-rpu", "-i", elementary_hevc, "-o", source)
+        # In the pinned dovi_tool, mode 2 removes mapping for FEL only; it
+        # preserves MEL mapping. Editor numeric mode 5 is a no-op in 2.3.4.
+        mode = 3 if _convert_profile5 else (2 if profile7_layer else None)
+        if original_rpu is not None:
+            if not profile7_layer or _convert_profile5:
+                raise ValueError("复用原始 RPU 仅适用于已校验的 Profile 7 双层片源。")
+            # prepare() already extracted and classified this RPU in display order.
+            # Apply the same conversion to it without reading the EL video again.
+            conversion = temp / "convert.json"
+            conversion.write_text(json.dumps({"mode": mode}), encoding="utf-8")
+            _run(run, "editor", "-i", original_rpu, "-j", conversion, "-o", source)
+        else:
+            args = ["-m", str(mode)] if mode else []
+            _run(run, *args, "extract-rpu", "-i", elementary_hevc, "-o", source)
         count = _count_profile8(source, run)
         area = _export_area(source, temp / "l5-input.json", run)
         initial = _area_intervals(area, source_width, source_height, count)
@@ -199,7 +211,7 @@ def inject_rpu(encoded_hevc, rpu, final_hevc, run):
 
 
 def verify_rpu(source_prepared, encoded_elementary, work_dir, run):
-    """Read back the output in display order; byte equality includes every frame, block and checksum."""
+    """Read back the HEVC or single-video Matroska output in display order, including every block."""
     with tempfile.TemporaryDirectory(dir=work_dir, prefix="dovi_verify_") as folder:
         copy = Path(folder) / "readback.rpu"
         _run(run, "extract-rpu", "-i", encoded_elementary, "-o", copy)

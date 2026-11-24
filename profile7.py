@@ -3,6 +3,9 @@
 import hashlib
 import json
 import re
+import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 import dovi
@@ -164,6 +167,61 @@ def layers(base, enhancement, expected, width, height, ffprobe, run):
         raise ValueError("基础层与增强层尺寸或逐帧数量不匹配。")
 
 
+def run_pipe(upstream, downstream, run, work):
+    """Pipe the Annex B byte stream without buffering a film in RAM or on disk."""
+    cancel = getattr(run, "cancel", None)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    producer = consumer = None
+    with tempfile.TemporaryFile(dir=work) as src_log, tempfile.TemporaryFile(dir=work) as dst_log:
+        try:
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError("任务已取消。")
+            producer = subprocess.Popen(
+                upstream,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=src_log,
+                creationflags=flags,
+            )
+            try:
+                consumer = subprocess.Popen(
+                    downstream,
+                    stdin=producer.stdout,
+                    stdout=dst_log,
+                    stderr=subprocess.STDOUT,
+                    creationflags=flags,
+                )
+            finally:
+                producer.stdout.close()
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise InterruptedError("任务已取消。")
+                statuses = (producer.poll(), consumer.poll())
+                if any(status not in (None, 0) for status in statuses):
+                    messages = []
+                    stages = zip((upstream, downstream), statuses, (src_log, dst_log))
+                    for cmd, status, log in stages:
+                        end = log.seek(0, 2)
+                        log.seek(max(0, end - 1800))
+                        detail = log.read().decode("utf-8", "replace").strip()
+                        if status not in (None, 0) or detail:
+                            label = Path(cmd[0]).name
+                            if status is not None:
+                                label += f" ({status})"
+                            messages.append(f"{label} {detail}".rstrip())
+                    raise RuntimeError("双层 HEVC 流式拆分失败。\n" + "\n".join(messages))
+                if statuses == (0, 0):
+                    return
+                time.sleep(0.05)
+        finally:
+            for process in (consumer, producer):
+                if process is not None and process.poll() is None:
+                    process.kill()
+            for process in (consumer, producer):
+                if process is not None:
+                    process.wait()
+
+
 def prepare(
     source,
     base_index,
@@ -181,10 +239,8 @@ def prepare(
     """Return elementary BL, EL, original P7 RPU, classified layer type and display-frame count."""
     base, el = work / "BL.hevc", work / "EL.hevc"
     if el_index is None:
-        joined = work / "p7-interleaved.hevc"
-        extract(source, base_index, joined, run, limit=limit)
-        dovi._run(run, "demux", "-i", joined, "-b", base, "-e", el)
-        joined.unlink()
+        demux = [dovi.find_dovi_tool(), "demux", "-i", "-", "-b", base, "-e", el]
+        extract(source, base_index, "pipe:1", run, limit=limit, downstream=demux)
     else:
         extract(source, base_index, base, run, limit=limit)
         extract(source, el_index, el, run, limit=limit)
