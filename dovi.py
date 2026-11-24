@@ -88,7 +88,9 @@ def _export_area(rpu, target, run):
     if "," in str(target) or "=" in str(target):
         base = Path(tempfile.gettempdir()).resolve()
         if "," in str(base) or "=" in str(base):
-            raise ValueError("dovi_tool 的 L5 导出路径与临时目录均含逗号或等号，请指定另一工作目录。")
+            raise ValueError(
+                "dovi_tool 的 L5 导出路径与临时目录均含逗号或等号，请指定另一工作目录。"
+            )
         with tempfile.TemporaryDirectory(dir=base, prefix="dv_l5_") as scratch:
             return _export_area(rpu, Path(scratch) / "area.json", run)
     _run(run, "export", "-i", rpu, "-d", f"level5={target}")
@@ -140,6 +142,7 @@ def prepare_rpu(
     run,
     *,
     _convert_profile5=False,
+    profile7_layer=None,
 ):
     """Extract RPU in presentation order; rescale active-area offsets on the same uncropped raster."""
     if min(source_width, source_height, out_width, out_height) <= 0:
@@ -152,7 +155,10 @@ def prepare_rpu(
         source = temp / "source.rpu"
         # Mode 3 verifies every input RPU is profile 5 and removes its reshaping
         # and changes the color matrices after the picture has been reconstructed.
-        args = ["-m", "3"] if _convert_profile5 else []
+        if profile7_layer not in (None, "MEL", "FEL"):
+            raise ValueError("未知的 Profile 7 增强层。")
+        mode = 3 if _convert_profile5 else {"FEL": 2, "MEL": 5}.get(profile7_layer)
+        args = ["-m", str(mode)] if mode else []
         _run(run, *args, "extract-rpu", "-i", elementary_hevc, "-o", source)
         count = _count_profile8(source, run)
         area = _export_area(source, temp / "l5-input.json", run)

@@ -10,6 +10,16 @@ try {
     foreach ($item in @("bin/ffmpeg.exe","bin/ffprobe.exe","bin/dovi_tool.exe","bin/mkvtoolnix/mkvmerge.exe","bin/nvenc/NVEncC64.exe")) {
         if (-not (Test-Path -LiteralPath $item)) { throw "Missing $item. Run python tools/fetch_tools.py first." }
     }
+    $felDir = Join-Path $sourceRoot "bin/fel"
+    $felManifest = Get-Content -LiteralPath (Join-Path $felDir "runtime-sha256.json") -Raw | ConvertFrom-Json
+    foreach ($name in @("python.exe","python312.dll","python312.zip","vapoursynth.dll","vapoursynth.pyd","ffms2.dll","felbaker.dll")) {
+        if (-not $felManifest.PSObject.Properties[$name]) { throw "Incomplete FEL runtime manifest: $name. Run tools/fetch_fel.py." }
+    }
+    foreach ($entry in $felManifest.PSObject.Properties) {
+        if ([IO.Path]::GetFileName($entry.Name) -ne $entry.Name) { throw "Unexpected FEL runtime filename." }
+        $file = Join-Path $felDir $entry.Name
+        if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $entry.Value) { throw "FEL runtime checksum mismatch: $file" }
+    }
     $params = @("-m","PyInstaller","--noconfirm","--onedir","--windowed","--noupx",
         "--contents-directory",".","--name","LumaFrameStudio","--icon",(Join-Path $sourceRoot "assets/icon.ico"),
         "--distpath",$dist,"--workpath",(Join-Path $Output "cache"),"--specpath",$Output,

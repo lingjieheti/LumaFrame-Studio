@@ -121,7 +121,7 @@ class _Runner:
 
 
 def _probe(path, run):
-    return json.loads(
+    data = json.loads(
         run(
             [
                 _tool("ffprobe"),
@@ -136,6 +136,18 @@ def _probe(path, run):
             ]
         )
     )
+    videos = [
+        s
+        for s in data["streams"]
+        if s["codec_type"] == "video" and not s.get("disposition", {}).get("attached_pic")
+    ]
+    if len(videos) == 2:
+        import profile7
+
+        pair = profile7.track_pair(path, data, videos)
+        if pair:
+            data["_p7_bl"], data["_p7_el"] = (s["index"] for s in pair)
+    return data
 
 
 def _video(data):
@@ -145,6 +157,8 @@ def _video(data):
         if s["codec_type"] == "video" and not s.get("disposition", {}).get("attached_pic")
     ]
     if len(videos) != 1:
+        if "_p7_bl" in data:
+            return next(s for s in videos if s["index"] == data["_p7_bl"])
         raise ValueError("需要恰好一条主视频轨。含多角度、辅助视频轨或无视频轨的文件目前无法处理。")
     return videos[0]
 
@@ -180,6 +194,8 @@ def _describe(path, data):
         fps=str(fps),
         profile="",
         dv_profile=None,
+        can_keep7=False,
+        el_index=data.get("_p7_el"),
         duration=float(data.get("format", {}).get("duration") or 0),
         source_type="other",
         supported=False,
@@ -203,7 +219,8 @@ def _describe(path, data):
             raise ValueError("容器带额外的轨道裁切信息，无法用现有几何参数安全放大。")
         if v.get("field_order") not in (None, "unknown", "progressive"):
             raise ValueError("隔行视频需要先去隔行。")
-        dv = next((s for s in v.get("side_data_list", []) if "dv_profile" in s), None)
+        signal = next((s for s in data["streams"] if s["index"] == info["el_index"]), v)
+        dv = next((s for s in signal.get("side_data_list", []) if "dv_profile" in s), None)
         if dv:
             p, c = dv.get("dv_profile"), dv.get("dv_bl_signal_compatibility_id")
             info["profile"] = f"Dolby Vision Profile {p}" + (f".{c}" if p == 8 else "")
@@ -212,6 +229,13 @@ def _describe(path, data):
                 from profile5 import validate_profile5
 
                 validate_profile5(v)
+            elif p == 7:
+                import profile7
+
+                profile7.validate_base(
+                    v, profile7.config(signal), split=info["el_index"] is not None
+                )
+                info["profile"] += " 双层"
             else:
                 dovi.validate_profile(v)
             if sar != 1:
@@ -251,8 +275,34 @@ def _describe(path, data):
     return info
 
 
-def _inspect(path, data, run):
+def _inspect(path, data, run, *, sample_layers=True):
     info = _describe(path, data)
+    if info["supported"] and info["dv_profile"] == 7:
+        info["can_keep7"] = 3840 <= info["width"] <= 4096 and (info["width"], info["height"]) == (
+            info["target_width"],
+            info["target_height"],
+        )
+        if sample_layers:
+            import profile7
+
+            try:
+                with tempfile.TemporaryDirectory(prefix="lf-p7-") as directory:
+                    *_, layer, _ = profile7.prepare(
+                        path,
+                        _video(data)["index"],
+                        info["el_index"],
+                        Path(directory),
+                        info["width"],
+                        info["height"],
+                        None,
+                        _extract,
+                        _tool("ffprobe"),
+                        run,
+                        limit=12,
+                    )
+                info["profile"] += f" · {layer}"
+            except (ValueError, RuntimeError) as exc:
+                info.update(supported=False, can_keep7=False, reason=str(exc))
     if info["source_type"] == "sdr" and info["assumptions"]:
         # An elementary HEVC stream can carry RPU NALs without a container
         # configuration record. Do not let the HD/BT.709 fallback consume them.
@@ -292,7 +342,7 @@ def inspect_source(path):
     return _inspect(path, _probe(path, run), run)
 
 
-def _times(path, index, run):
+def _times(path, index, run, *, coded_order=False):
     # Packet PTS is in presentation order after sorting, even with B-frame reordering.
     value = run(
         [
@@ -319,7 +369,7 @@ def _times(path, index, run):
         times.append(round(float(token) * 1_000_000))
     if not times or len(set(times)) != len(times):
         raise ValueError("视频显示时间戳为空或重复，无法保证逐帧同步。")
-    return sorted(times)
+    return times if coded_order else sorted(times)
 
 
 def _static_hdr(path, video, run):
@@ -364,7 +414,7 @@ def _static_hdr(path, video, run):
     return master, cll
 
 
-def _extract(source, video_index, dest, run):
+def _extract(source, video_index, dest, run, *, limit=None):
     run(
         [
             _tool("ffmpeg"),
@@ -375,6 +425,7 @@ def _extract(source, video_index, dest, run):
             source,
             "-map",
             f"0:{video_index}",
+            *(["-frames:v", str(limit)] if limit else []),
             "-c:v",
             "copy",
             "-bsf:v",
@@ -447,7 +498,7 @@ def _check_dv_tier(path, video, config, cap, run):
     return ("High" if high else "Main"), level
 
 
-def _software_encode(source, out, info, video, mode, target, master, cll, run, progress):
+def _software_command(source, out, info, video, mode, target, master, cll):
     w, h = info["target_width"], info["target_height"]
     if target == "preserve" and info["dv_profile"] == 5:
         from profile5 import decode_profile5_filter
@@ -456,7 +507,8 @@ def _software_encode(source, out, info, video, mode, target, master, cll, run, p
             info["width"], info["height"], w, h, neural=mode == "neural"
         )
     elif target == "preserve" and mode == "reference":
-        init_args, vf = [], f"zscale=w={w}:h={h}:filter=spline36:dither=none,format=yuv420p10le"
+        dither = "error_diffusion" if info.get("enhancement_layer") == "FEL" else "none"
+        init_args, vf = [], f"zscale=w={w}:h={h}:filter=spline36:dither={dither},format=yuv420p10le"
     elif target == "preserve":
         from neural import ff_filter
 
@@ -488,6 +540,54 @@ def _software_encode(source, out, info, video, mode, target, master, cll, run, p
         params.append("master-display=" + master)
     if cll:
         params.append("max-cll=" + cll)
+    return [
+        _tool("ffmpeg"),
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "error",
+        "-progress",
+        "pipe:1",
+        *init_args,
+        "-noautorotate",
+        "-i",
+        source,
+        "-map",
+        f"0:{video['index']}",
+        "-an",
+        "-sn",
+        "-dn",
+        "-vf",
+        vf + ",setsar=1",
+        "-c:v",
+        "libx265",
+        "-preset",
+        "slow",
+        "-crf",
+        "14" if mode == "neural" or info["dv_profile"] == 7 else "16",
+        "-dolbyvision",
+        "0",
+        "-x265-params",
+        ":".join(params),
+        "-pix_fmt",
+        "yuv420p10le",
+        "-color_range",
+        "tv",
+        "-colorspace",
+        "bt2020nc",
+        "-color_primaries",
+        "bt2020",
+        "-color_trc",
+        "smpte2084",
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "hevc",
+        out,
+    ]
+
+
+def _software_encode(source, out, info, video, mode, target, master, cll, run, progress):
     name = "神经网络超分" if mode == "neural" else "高位深缩放"
 
     def report(line):
@@ -499,54 +599,7 @@ def _software_encode(source, out, info, video, mode, target, master, cll, run, p
                     name + "与 x265 高质量编码",
                 )
 
-    run(
-        [
-            _tool("ffmpeg"),
-            "-hide_banner",
-            "-nostdin",
-            "-v",
-            "error",
-            "-progress",
-            "pipe:1",
-            *init_args,
-            "-noautorotate",
-            "-i",
-            source,
-            "-map",
-            f"0:{video['index']}",
-            "-an",
-            "-sn",
-            "-dn",
-            "-vf",
-            vf + ",setsar=1",
-            "-c:v",
-            "libx265",
-            "-preset",
-            "slow",
-            "-crf",
-            "14" if mode == "neural" else "16",
-            "-dolbyvision",
-            "0",
-            "-x265-params",
-            ":".join(params),
-            "-pix_fmt",
-            "yuv420p10le",
-            "-color_range",
-            "tv",
-            "-colorspace",
-            "bt2020nc",
-            "-color_primaries",
-            "bt2020",
-            "-color_trc",
-            "smpte2084",
-            "-fps_mode",
-            "passthrough",
-            "-f",
-            "hevc",
-            out,
-        ],
-        report,
-    )
+    run(_software_command(source, out, info, video, mode, target, master, cll), report)
 
 
 def _mkv_inventory(path, run):
@@ -581,7 +634,7 @@ def _audio_starts(path, data, run):
 
 
 def _mux(source, encoded, out, info, timing, original, run, audio_starts):
-    video = next(t for t in original["tracks"] if t["type"] == "video")
+    video = [t for t in original["tracks"] if t["type"] == "video"][info.get("base_ordinal", 0)]
     props = video["properties"]
     fps = _ratio(info["fps"])
     args = [_tool("mkvmerge"), "--timestamp-scale", "100000", "-o", out]
@@ -617,7 +670,9 @@ def _mux(source, encoded, out, info, timing, original, run, audio_starts):
             if track["codec"] == "AAC" and packets:
                 first = packets[0]
                 pts = float(first.get("pts_time", 0))
-                if pts < 0 and any(s.get("skip_samples", 0) for s in first.get("side_data_list", [])):
+                if pts < 0 and any(
+                    s.get("skip_samples", 0) for s in first.get("side_data_list", [])
+                ):
                     args += ["--sync", f"{track['id']}:{round(pts * 1000)}"]
     args.append(source)
     run(args)
@@ -697,6 +752,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
         raise ValueError("请选择现有文件夹中的 .mkv 输出文件。")
     if mode not in {"quality", "reference", "neural", "rtx"} or target not in {
         "preserve",
+        "keep7",
         "hdr10",
         "newdv",
     }:
@@ -704,22 +760,30 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
     run = _Runner(cancel)
     progress(0, "检查片源与轨道")
     data = _probe(source, run)
-    info = _inspect(source, data, run)
+    info = _inspect(source, data, run, sample_layers=False)
     if not info["supported"]:
         raise ValueError(info["reason"])
-    if (target == "preserve") != (info["source_type"] == "dv"):
+    native = target == "keep7"
+    if native and not info["can_keep7"]:
+        raise ValueError("双层原样保留仅适用于原生 4K Profile 7 片源。")
+    if native:
+        mode = "reference"
+    if (target in {"preserve", "keep7"}) != (info["source_type"] == "dv"):
         raise ValueError(
-            "杜比视界保留需要 Profile 5 或 8.1 片源；HDR10 与新杜比视界制作需要 SDR 片源。"
+            "杜比视界保留需要 Profile 5、7 或 8.1 片源；HDR10 与新杜比视界制作需要 SDR 片源。"
         )
-    if mode == "quality" and info["dv_profile"] == 5:
-        raise ValueError("Profile 5 需要先重建色彩，请选择 RTX AI、FSRCNNX 或参考模式。")
+    if mode == "quality" and info["dv_profile"] in {5, 7}:
+        raise ValueError(
+            "此杜比视界配置需要先处理色彩或增强层，请选择 RTX AI、FSRCNNX 或参考模式。"
+        )
     if mode == "quality" and target != "preserve":
         raise ValueError(
             "NIS 模式仅处理现有 Profile 8.1 片源；SDR 片源可选择 RTX AI、FSRCNNX 或参考模式。"
         )
     if (
         mode == "neural"
-        and min(info["target_width"] / info["width"], info["target_height"] / info["height"]) <= 1.30
+        and min(info["target_width"] / info["width"], info["target_height"] / info["height"])
+        <= 1.30
     ):
         raise ValueError("FSRCNNX 需要超过 1.30 倍的放大；请改用参考模式或可用的 RTX AI。")
     if mode == "rtx" and (info["width"], info["height"]) == (
@@ -729,20 +793,35 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
         raise ValueError("此片源已达到输出尺寸，请使用参考模式在原分辨率处理。")
     video = _video(data)
     original = _mkv_inventory(source, run)
-    if (
-        not original.get("container", {}).get("supported")
-        or sum(t["type"] == "video" for t in original.get("tracks", [])) != 1
-    ):
+    copy_container = (
+        native and info["el_index"] is None and original["container"].get("type") == "Matroska"
+    )
+    if not original.get("container", {}).get("supported") or sum(
+        t["type"] == "video" for t in original.get("tracks", [])
+    ) != (2 if info["el_index"] is not None else 1):
         raise ValueError("封装工具无法完整读取此文件的单一主视频轨。")
-    if any(t.get("disposition", {}).get("attached_pic") for t in data["streams"]) and not original.get(
-        "attachments"
-    ):
+    if any(
+        t.get("disposition", {}).get("attached_pic") for t in data["streams"]
+    ) and not original.get("attachments"):
         raise ValueError("此容器封面无法按原附件保留。")
     with tempfile.TemporaryDirectory(dir=dest.parent, prefix=".hdr-render-") as folder:
         scratch = Path(folder)
         run.worker_cancel = scratch / "cancel.rtx"
         progress(2, "读取原片逐帧时间戳")
-        times = _times(source, video["index"], run)
+        coded_times = _times(source, video["index"], run, coded_order=True)
+        if info["el_index"] is not None:
+            el_times = _times(source, info["el_index"], run, coded_order=True)
+            if len(coded_times) != len(el_times) or any(
+                abs(a - b) > 2 for a, b in zip(coded_times, el_times)
+            ):
+                raise ValueError("双轨 BL/EL 的逐帧顺序或时间戳不匹配。")
+            video_tracks = [
+                s["index"]
+                for s in data["streams"]
+                if s["codec_type"] == "video" and not s.get("disposition", {}).get("attached_pic")
+            ]
+            info["base_ordinal"] = video_tracks.index(video["index"])
+        times = sorted(coded_times)
         timing = scratch / "timecodes.txt"
         timing.write_text(
             "# timestamp format v2\n" + "\n".join(f"{t / 1000:.3f}" for t in times) + "\n",
@@ -750,7 +829,95 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
         )
         rpu = scratch / "scaled.rpu"
         encoded = scratch / "encoded.hevc"
-        if target == "preserve":
+        picture, picture_video = source, video
+        streamed = False
+        signatures = None
+        if info["dv_profile"] == 7:
+            import profile7
+
+            progress(4, "拆分并逐帧核对 Profile 7 基础层、增强层与 RPU")
+            base, el, original_rpu, layer, _ = profile7.prepare(
+                source,
+                video["index"],
+                info["el_index"],
+                scratch,
+                info["width"],
+                info["height"],
+                len(times),
+                _extract,
+                _tool("ffprobe"),
+                run,
+            )
+            info["enhancement_layer"] = layer
+            master, cll = _static_hdr(source, video, run)
+            if native:
+                progress(10, "校验原始双层视频并复制编码画面")
+                signatures = tuple(profile7.signature(p, cancel) for p in (base, el))
+                if any(frames != len(times) for frames, _ in signatures):
+                    raise ValueError("双层编码图像数与原片显示帧数不符。")
+                if not copy_container:
+                    dovi._run(run, "mux", "--bl", base, "--el", el, "-o", encoded)
+                rpu = original_rpu
+            else:
+                if layer not in ("FEL", "MEL"):
+                    raise ValueError("混合 FEL/MEL 请使用原生 4K 双层原样保留模式。")
+                dovi.prepare_rpu(
+                    el,
+                    rpu,
+                    info["width"],
+                    info["height"],
+                    info["target_width"],
+                    info["target_height"],
+                    scratch,
+                    run,
+                    profile7_layer=layer,
+                )
+                if layer == "FEL":
+                    from felbake import bake
+                    from profile5 import static_from_rpu
+
+                    dv_master, dv_cll = static_from_rpu(rpu, scratch, run, source_master=master)
+                    master, cll = dv_master or master, dv_cll or cll
+                    progress(8, "逐帧合成基础层与 FEL 残差")
+                    streamed = mode in {"reference", "neural"}
+                    command = None
+                    if streamed:
+                        command = _software_command(
+                            "pipe:0", encoded, info, {"index": 0}, mode, target, master, cll
+                        )
+                    baked = bake(
+                        base,
+                        el,
+                        original_rpu,
+                        scratch,
+                        info["fps"],
+                        info["width"],
+                        info["height"],
+                        len(times),
+                        run,
+                        progress,
+                        encoder_command=command,
+                    )
+                    if not streamed:
+                        picture = baked
+                else:
+                    picture = scratch / "base.mkv"
+                    run(
+                        [
+                            _tool("mkvmerge"),
+                            "-q",
+                            "-o",
+                            picture,
+                            "--default-duration",
+                            "0:" + info["fps"] + "fps",
+                            base,
+                        ]
+                    )
+                if not streamed:
+                    picture_video = _video(_probe(picture, run))
+            base.unlink()
+            el.unlink()
+        elif target == "preserve":
             progress(5, "提取杜比视界元数据并换算有效画面尺寸")
             source_es = scratch / "original.hevc"
             _extract(source, video["index"], source_es, run)
@@ -780,10 +947,16 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                 fallback_master, fallback_cll = static_from_rpu(rpu, scratch, run)
                 master, cll = master or fallback_master, cll or fallback_cll
         else:
-            master, cll = "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)", None
-        progress(12, "生成 4K 10 位 PQ 视频")
+            master, cll = (
+                "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)",
+                None,
+            )
+        if not native and not streamed:
+            progress(12, "生成 4K 10 位 PQ 视频")
         has_rpu = target == "preserve" and mode in {"quality", "rtx"}
-        if has_rpu or mode == "rtx":
+        if native:
+            progress(74, "已保留原始双层视频")
+        elif has_rpu or mode == "rtx":
             from ai import nvenc_command
 
             sdr_args = dict(sdr_to_hdr=True) if target != "preserve" else {}
@@ -794,7 +967,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                 else dict(max_bitrate=min(60000, cap))
             )
             cmd = nvenc_command(
-                source,
+                picture,
                 encoded,
                 info["target_width"],
                 info["target_height"],
@@ -824,8 +997,12 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                     progress(12 + min(100, float(m[1])) * 0.6, "NVIDIA 高位深缩放与 HEVC 编码")
 
             run(cmd, nv_progress)
-        else:
-            _software_encode(source, encoded, info, video, mode, target, master, cll, run, progress)
+        elif not streamed:
+            _software_encode(
+                picture, encoded, info, picture_video, mode, target, master, cll, run, progress
+            )
+        if picture != source:
+            picture.unlink()
         if target == "newdv":
             from hdr import measure_output
 
@@ -834,7 +1011,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
             meta = dovi.generate_rpu_from_measurements(measurements, rpu, scratch, run)
             if meta["frame_count"] != len(times):
                 raise ValueError("新生成的 RPU 帧数与原视频不一致。")
-        if target != "hdr10" and not has_rpu:
+        if target not in {"hdr10", "keep7"} and not has_rpu:
             progress(81, "写入逐帧杜比视界元数据")
             injected = scratch / "with-rpu.hevc"
             run([dovi.find_dovi_tool(), "inject-rpu", "-i", encoded, "-r", rpu, "-o", injected])
@@ -843,12 +1020,23 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
         progress(84, "按原时间戳封装视频及原片轨道")
         muxed = scratch / "verified.mkv"
         starts = _audio_starts(source, data, run)
-        _mux(source, encoded, muxed, info, timing, original, run, starts)
-        encoded.unlink()
+        if copy_container:
+            with source.open("rb") as incoming, muxed.open("xb") as outgoing:
+                size = source.stat().st_size
+                while block := incoming.read(8 * 1024 * 1024):
+                    _check_cancel(cancel)
+                    outgoing.write(block)
+                    progress(84 + int(5 * incoming.tell() / size), "原样复制 Matroska 文件")
+        else:
+            _mux(source, encoded, muxed, info, timing, original, run, starts)
+            encoded.unlink()
         progress(90, "复读输出并核验逐帧时间、色彩与副轨")
         out_data = _probe(muxed, run)
         out_video = _video(out_data)
-        if (out_video["width"], out_video["height"]) != (info["target_width"], info["target_height"]):
+        if (out_video["width"], out_video["height"]) != (
+            info["target_width"],
+            info["target_height"],
+        ):
             raise ValueError("导出尺寸校验失败。")
         if any(
             out_video.get(k) != x
@@ -862,7 +1050,11 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
         ):
             raise ValueError("输出的 10 位 HDR10/PQ 色彩信令未通过校验。")
         tier, dv_level = None, None
-        if target != "hdr10":
+        if native:
+            cfg = profile7.config(out_video)
+            profile7.validate_base(out_video, cfg)
+            dv_level = cfg.get("dv_level")
+        elif target != "hdr10":
             cfg = dovi.validate_profile(out_video)
             cap = min(60000, _vbv_limit(info)) if mode == "quality" else _vbv_limit(info)
             tier, dv_level = _check_dv_tier(muxed, out_video, cfg, cap, run)
@@ -891,7 +1083,31 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                     if abs(float(packet["pts_time"]) - valid[packet["data_hash"]]) > 0.003:
                         raise ValueError("封装后音轨相对视频发生时移。")
         digest = None
-        if target != "hdr10":
+        if native:
+            progress(95, "逐层复核基础层、增强层和原始动态元数据")
+            review = scratch / "readback"
+            review.mkdir()
+            bl_out, el_out, rpu_out, out_layer, _ = profile7.prepare(
+                muxed,
+                out_video["index"],
+                None,
+                review,
+                info["width"],
+                info["height"],
+                len(times),
+                _extract,
+                _tool("ffprobe"),
+                run,
+            )
+            verified_layers = tuple(profile7.signature(p, cancel) for p in (bl_out, el_out))
+            digest = dovi._digest(rpu_out)
+            if (
+                verified_layers != signatures
+                or out_layer != info["enhancement_layer"]
+                or digest != dovi._digest(rpu)
+            ):
+                raise ValueError("成片 BL、EL 或原始 RPU 字节校验失败。")
+        elif target != "hdr10":
             progress(95, "逐帧复核最终文件内的 RPU")
             final_es = scratch / "final.hevc"
             _extract(muxed, out_video["index"], final_es, run)
@@ -917,5 +1133,13 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
             audio_count=info["audio_count"],
             subtitle_count=info["subtitle_count"],
         )
+        if info["dv_profile"] == 7:
+            result.update(
+                input_dv_profile=7,
+                enhancement_layer=info["enhancement_layer"],
+                output_dv_profile=7 if native else 8,
+            )
+        if signatures:
+            result.update(bl_sha256=signatures[0][1], el_sha256=signatures[1][1])
     progress(100, "导出与校验均已完成")
     return result

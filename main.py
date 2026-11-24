@@ -55,10 +55,15 @@ from PySide6.QtWidgets import (
 )
 from glass import ASSETS, GlassButton, Material, Rail, Stage, Select
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 REPO = "https://github.com/lingjieheti/LumaFrame-Studio"
 SPONSOR = "https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md"
-TARGETS = {"preserve": "保留杜比视界", "newdv": "生成杜比视界", "hdr10": "生成 HDR10"}
+TARGETS = {
+    "preserve": "保留杜比视界",
+    "keep7": "原样保留双层 · Profile 7",
+    "newdv": "生成杜比视界",
+    "hdr10": "生成 HDR10",
+}
 MODES = {
     "rtx": "NVIDIA RTX AI · 高码率 Ultra",
     "neural": "FSRCNNX · 神经网络",
@@ -293,7 +298,11 @@ class Studio(QMainWindow):
         for title, body in [
             (
                 "保留原片",
-                "适用于支持的单层杜比视界片源。软件适配逐镜有效画面区域，写入并逐帧复核动态元数据。",
+                "单层片源输出 Profile 8.1。原生 4K 的双层 Profile 7 可原样封装，保留基础层、增强层和动态元数据。",
+            ),
+            (
+                "双层杜比转单层",
+                "电视需要 Profile 8.1 时可选择合成输出。FEL 的增强层参与画面重建，合成后编码为 10 位；MEL 走基础层和元数据转换流程。",
             ),
             (
                 "普通视频转 HDR",
@@ -453,7 +462,7 @@ class Studio(QMainWindow):
                 vf = "scale=640:-2"
                 if result["source_type"] == "dv":
                     vf = "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=mobius,zscale=p=bt709:t=bt709:m=bt709:r=limited,format=yuv420p,scale=640:-2"
-                    if "Profile 5" in result["profile"]:
+                    if result.get("dv_profile") in (5, 7):
                         return
                 p = subprocess.run(
                     [
@@ -520,11 +529,14 @@ class Studio(QMainWindow):
     def refill_targets(self):
         self.targets.blockSignals(True)
         self.targets.clear()
-        keys = ["hdr10", "newdv"] if self.info and self.info["source_type"] == "sdr" else ["preserve"]
+        info = self.info or {}
+        keys = ["hdr10", "newdv"] if info.get("source_type") == "sdr" else ["preserve"]
+        if info.get("can_keep7"):
+            keys.insert(0, "keep7")
         for key in keys:
             caption = TARGETS[key]
-            if key == "preserve" and self.info and "Profile 5" in self.info["profile"]:
-                caption = "杜比视界 Profile 5 → Profile 8.1"
+            if key == "preserve" and info.get("dv_profile") in (5, 7):
+                caption = f"杜比视界 Profile {info['dv_profile']} → Profile 8.1"
             self.targets.addItem(caption, key)
         self.targets.blockSignals(False)
         self.target_change()
@@ -538,7 +550,7 @@ class Studio(QMainWindow):
             if k == "preserve"
             else ["rtx", "neural", "reference"]
         )
-        if k == "preserve" and self.info and "Profile 5" in self.info["profile"]:
+        if k == "preserve" and self.info and self.info.get("dv_profile") in (5, 7):
             keys = ["rtx", "neural", "reference"]
         if self.info and self.info["supported"]:
             ratio = min(
@@ -550,7 +562,11 @@ class Studio(QMainWindow):
             if ratio <= 1.0:
                 keys = ["reference"]
         for key in keys:
-            name = MODES[key] if k == "preserve" or key != "reference" else "Spline36 · 高位深扩展"
+            name = MODES[key]
+            if k == "keep7":
+                name = "无损封装 · 原始双层码流"
+            elif key == "reference" and k in ("hdr10", "newdv"):
+                name = "Spline36 · 高位深扩展"
             self.modes.addItem(name, key)
         self.modes.blockSignals(False)
         self.mode_change()
@@ -565,7 +581,13 @@ class Studio(QMainWindow):
             "quality": "采用 NVIDIA Image Scaling 与硬件编码，适合快速导出。",
         }
         text = tips.get(key, "")
-        if self.targets.currentData() == "newdv":
+        if self.targets.currentData() == "keep7":
+            text = "直接保留原始画质和逐帧杜比数据。此格式需要支持 Profile 7 的播放器。"
+        elif self.info and self.info.get("dv_profile") == 7 and self.targets.currentData() == "preserve":
+            text += " 导出前会读取增强层，生成 HDR10 兼容的单层 Profile 8.1。"
+            if key == "rtx" and "FEL" in self.info.get("profile", ""):
+                text += " RTX 会先写入 12 位无损中间文件，长片需要较大的临时空间。FSRCNNX 和 Spline36 可逐帧直接编码。"
+        elif self.targets.currentData() == "newdv":
             text += " 按新画面测量生成杜比动态元数据。"
         self.hint.setText(text)
 
@@ -574,7 +596,8 @@ class Studio(QMainWindow):
             return
         src = Path(self.info["path"])
         dest = Path(self.settings.value("outputDir", str(src.parent)))
-        prefix = src.stem + ("-4K-HDR10" if self.targets.currentData() == "hdr10" else "-4K-DV")
+        suffix = {"hdr10": "-4K-HDR10", "keep7": "-4K-DV-P7"}.get(self.targets.currentData(), "-4K-DV")
+        prefix = src.stem + suffix
         f = dest / (prefix + ".mkv")
         i = 2
         while f.exists():
@@ -776,8 +799,8 @@ def export_command(argv):
     parser.add_argument("input")
     parser.add_argument("--output", required=True)
     parser.add_argument("--result", required=True, help="New JSON file for the verification result")
-    parser.add_argument("--target", choices=tuple(TARGETS), default="preserve")
-    parser.add_argument("--mode", choices=tuple(MODES), default="rtx")
+    parser.add_argument("--target", choices=tuple(TARGETS))
+    parser.add_argument("--mode", choices=tuple(MODES))
     parser.add_argument("--sample", action="store_true")
     options = parser.parse_args(argv)
     result_file = Path(options.result)
@@ -787,10 +810,20 @@ def export_command(argv):
         return 2
     with report:
         try:
+            if options.sample or not options.target or not options.mode:
+                data = engine.inspect_source(options.input)
+                if not data["supported"]:
+                    raise ValueError(data["reason"])
+                if not options.target:
+                    options.target = "keep7" if data.get("can_keep7") else (
+                        "hdr10" if data["source_type"] == "sdr" else "preserve"
+                    )
+                if not options.mode:
+                    native = (data["width"], data["height"]) == (data["target_width"], data["target_height"])
+                    options.mode = "reference" if native else "rtx"
             if options.sample:
                 from preview import render_sample
 
-                data = engine.inspect_source(options.input)
                 result = render_sample(
                     options.input,
                     options.output,

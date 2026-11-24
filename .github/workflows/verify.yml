@@ -14,3 +14,4 @@ jobs:
       - run: python -m compileall -q -x "(/|\\)\.git" .
       - run: python tests/test_desktop.py
       - run: python tests/test_formats.py
+      - run: python tests/test_profile7.py

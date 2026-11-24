@@ -1,4 +1,4 @@
-"""Fetch the upstream Windows x64 tools used in LumaFrame Studio 1.0.0."""
+"""Fetch the upstream Windows x64 media tools used in LumaFrame Studio."""
 
 import argparse
 from dataclasses import dataclass
@@ -144,7 +144,7 @@ def fetch(pkg, cache):
         temporary = Path(name)
         try:
             print(f"Downloading {pkg.url}", flush=True)
-            request = Request(pkg.url, headers={"User-Agent": "LumaFrameStudio/1.0.0"})
+            request = Request(pkg.url, headers={"User-Agent": "LumaFrameStudio/1.1.0"})
             with os.fdopen(fd, "wb") as output, urlopen(request, timeout=60) as response:
                 shutil.copyfileobj(response, output, length=1024 * 1024)
             actual = digest(temporary)

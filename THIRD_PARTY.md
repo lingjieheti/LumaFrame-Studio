@@ -1,8 +1,10 @@
-# LumaFrame Studio 1.0.0 的第三方组件
+# LumaFrame Studio 1.1.0 的第三方组件
 
 从源码构建 Windows x64 版时，在项目根目录运行 `py -3.12 tools/fetch_tools.py`。脚本只使用 Python 标准库；解压 7z 需要已安装的 7-Zip。每次安装均验证完整下载的 SHA-256，再按文件清单提取到 `bin`、`shaders` 和 `licenses`。镜像缓存可用 `--cache` 指定，缓存文件同样经过校验。Python 包版本见 `requirements-build.txt`。[下载清单与完整校验值](tools/fetch_tools.py) · [7-Zip](https://www.7-zip.org/)
 
 ## 媒体程序和着色器
+
+双层 FEL 合成组件在构建时通过 `tools/fetch_fel.py` 单独下载和校验。发布包随附独立解释器、VapourSynth R73、FFMS2 5.0、FelBaker 1.0.0 和运行库清单。Windows 用户无需安装系统 Python、AviSynth 或 VapourSynth。[源代码、构建和许可清单](licenses/fel-components.md)
 
 | 组件 | 项目使用的文件与许可 | 版本、源码与版权说明 |
 |---|---|---|

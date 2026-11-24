@@ -33,7 +33,9 @@ def validate_profile5(stream):
 
 
 def prepare_profile5_rpu(elementary_hevc, rpu_out, sw, sh, tw, th, work_dir, run):
-    return prepare_rpu(elementary_hevc, rpu_out, sw, sh, tw, th, work_dir, run, _convert_profile5=True)
+    return prepare_rpu(
+        elementary_hevc, rpu_out, sw, sh, tw, th, work_dir, run, _convert_profile5=True
+    )
 
 
 def _constant_values(path):
@@ -48,7 +50,7 @@ def _constant_values(path):
     return first
 
 
-def static_from_rpu(rpu, work_dir, run):
+def static_from_rpu(rpu, work_dir, run, *, source_master=None):
     """Recover static HDR10 metadata only when the RPU explicitly carries it."""
     where = Path(work_dir).resolve()
     if any(c in str(where) for c in "=,"):
@@ -57,21 +59,32 @@ def static_from_rpu(rpu, work_dir, run):
         return None, None
     with tempfile.TemporaryDirectory(dir=where, prefix="p5_static_") as folder:
         l6, l9 = (Path(folder) / f"l{n}.csv" for n in (6, 9))
-        run([str(find_dovi_tool()), "export", "-i", str(rpu), "--levels", f"level6={l6},level9={l9}"])
+        run(
+            [
+                str(find_dovi_tool()),
+                "export",
+                "-i",
+                str(rpu),
+                "--levels",
+                f"level6={l6},level9={l9}",
+            ]
+        )
         light, gamut = _constant_values(l6), _constant_values(l9)
     if not light:
         return None, None
     cll, fall = int(light["max_content_light_level"]), int(light["max_frame_average_light_level"])
     cll_text = f"{cll},{fall}" if cll or fall else None
-    if not gamut:
-        return None, cll_text
     # Most common registered mastering displays: DCI-P3 D65, BT.709 and BT.2020.
     gamuts = {
         0: "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)",
         1: "G(15000,30000)B(7500,3000)R(32000,16500)WP(15635,16450)",
         2: "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)",
     }
-    coords = gamuts.get(int(gamut["source_primary_index"]))
+    coords = gamuts.get(int(gamut["source_primary_index"])) if gamut else None
+    if coords is None and source_master:
+        # P7 uses a PQ base layer with separately signalled mastering primaries.
+        # If no L9 is supplied, retain those coordinates but use L6 luminance.
+        coords = source_master.partition("L(")[0]
     peak = int(light["max_display_mastering_luminance"]) * 10000
     floor = int(light["min_display_mastering_luminance"])
     if not coords or not 0 < peak <= 100000000 or floor >= peak:

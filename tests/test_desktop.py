@@ -58,6 +58,21 @@ def run(source=None, pictures=None):
         assert window.density == 70
         window.nav[1].click()
         assert window.stack.currentIndex() == 1
+        p7 = {
+            "dv_profile": 7, "source_type": "dv", "width": 3840, "height": 2160,
+            "target_width": 3840, "target_height": 2160, "supported": True,
+            "path": str(Path(temp) / "dual.mkv"), "can_keep7": True,
+        }
+        window.info = p7
+        window.refill_targets()
+        assert window.targets.currentData() == "keep7" and window.modes.count() == 1
+        assert "无损" in window.modes.currentText() and "-P7" in window.path.text()
+        window.targets.setCurrentIndex(window.targets.findData("preserve"))
+        assert window.modes.currentData() == "reference" and "Profile 8.1" in window.hint.text()
+        window.info = dict(p7, width=1920, height=1080, can_keep7=False)
+        window.refill_targets()
+        assert window.targets.count() == 1 and window.modes.currentData() == "rtx"
+        window.info = None
         if source:
             window.load(str(Path(source).resolve()))
             spin(12, lambda: window.info is not None)
@@ -66,6 +81,12 @@ def run(source=None, pictures=None):
             assert window.path.text().endswith(".mkv")
             assert window.targets.count() and window.modes.count()
             print(window.film_detail.text(), window.modes.currentData())
+            if pictures and window.info.get("can_keep7"):
+                window.nav[0].click()
+                window.path.setText("D:/影片/双层杜比测试片-4K-DV-P7.mkv")
+                window.path.setCursorPosition(0)
+                spin(0.15)
+                screenshot("workspace-dual.png")
         window.close()
         app.processEvents()
 
