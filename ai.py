@@ -40,6 +40,7 @@ def nvenc_command(
     sdr_to_hdr=False,
     fel_input=None,
     sdr_mapping="expand",
+    compressed_source=False,
 ):
     """Return argv. `source` is a verified limited-range BT.2020/PQ main layer."""
     width, height = int(width), int(height)
@@ -47,6 +48,8 @@ def nvenc_command(
         raise ValueError("4:2:0 输出宽高必须为正偶数。")
     if not 0 <= int(quality) <= 51 or not 1000 <= int(max_bitrate) <= 240000:
         raise ValueError("编码质量或最大码率超出范围。")
+    if compressed_source and (mode != "rtx" or sdr_to_hdr or fel_input is not None):
+        raise ValueError("压缩片源修复仅适用于需要超分的杜比视界 Profile 8.1。")
     exe = nvenc_exe()
     if not exe.is_file():
         raise FileNotFoundError(f"找不到 NVEncC 编码器：{exe}")
@@ -64,6 +67,8 @@ def nvenc_command(
             sdr_to_hdr=sdr_to_hdr,
             sdr_mapping=sdr_mapping,
         )
+        if compressed_source:
+            payload["compressed_source"] = True
         if fel_input is not None:
             iw, ih, fps = fel_input
             if source != "pipe:0" or sdr_to_hdr or min(iw, ih) < 2 or iw % 2 or ih % 2:

@@ -323,7 +323,8 @@ def decoder_input(params, hidden):
     probe = subprocess.check_output(
         [
             bundled_tool("ffprobe"), "-v", "error", "-select_streams", "V:0", "-show_entries",
-            "stream=width,height,avg_frame_rate,r_frame_rate,color_range,pix_fmt:stream_side_data=dv_profile",
+            "stream=width,height,avg_frame_rate,r_frame_rate,color_range,pix_fmt:"
+            "stream_side_data=dv_profile,dv_bl_signal_compatibility_id",
             "-of", "json", src,
         ],
         creationflags=hidden,
@@ -362,6 +363,12 @@ def run_worker(params):
     iw, ih = stream["width"], stream["height"]
     if iw >= w and ih >= h:
         raise ValueError("RTX 超分需要至少一个方向的画面尺寸放大。")
+    compressed = params.get("compressed_source", False)
+    if compressed and not any(
+        side.get("dv_profile") == 8 and side.get("dv_bl_signal_compatibility_id") == 1
+        for side in stream.get("side_data_list", [])
+    ):
+        raise ValueError("压缩片源修复需要 HDR10 兼容的 Dolby Vision Profile 8.1 输入。")
     nvvfx, libs = load_sdk(Path(params["output"]).resolve().parent)
     ffmpeg = [bundled_tool("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error"]
     # RGB10A2 expects red in bits 0..9. FFmpeg calls exactly that layout x2bgr10le.
@@ -382,6 +389,9 @@ def run_worker(params):
         init_args, rgb16_filter = decode_profile5_filter(iw, ih, iw, ih, output_rgb=True)
     if rgb16_filter is None:
         source_filter = pq_to_rgb10(source_range)
+        if compressed:
+            # Filter in the original 10-bit PQ luma/chroma planes before the model.
+            source_filter = "hqdn3d=1.5:1.0:2.0:1.5," + source_filter
     else:
         # SDR and P5 are reconstructed as RGB16 on Vulkan. Keep chroma at
         # full resolution all the way to the model input.
@@ -436,8 +446,10 @@ def run_worker(params):
         mastering=params["mastering"],
         max_cll=params["max_cll"],
     )
+    quality = nvvfx.QualityLevel.ULTRA if compressed else nvvfx.QualityLevel.HIGHBITRATE_ULTRA
+    strength = 0.6 if compressed else 1.0
     print(
-        f"NVIDIA RTX Video Super Resolution | VFX {nvvfx.get_sdk_version()} | HIGHBITRATE_ULTRA "
+        f"NVIDIA RTX Video Super Resolution | VFX {nvvfx.get_sdk_version()} | {quality.name} {strength:.2f} "
         f"| RGB10A2 {iw}x{ih} -> {w}x{h}",
         flush=True,
     )
@@ -447,7 +459,8 @@ def run_worker(params):
         stack.callback(gpu.close)
         effect = stack.enter_context(
             nvvfx.VideoSuperRes(
-                quality=nvvfx.QualityLevel.HIGHBITRATE_ULTRA,
+                quality=quality,
+                strength=strength,
                 device=0,
                 image_encoding=nvvfx.ImageEncoding.RGB10A2,
             )

@@ -3,6 +3,7 @@
 import re
 import shutil
 import tempfile
+from array import array
 from functools import lru_cache
 from pathlib import Path
 
@@ -64,38 +65,34 @@ def measure_output(base_file, work_dir, run):
     ffmpeg = str(exe) if exe.exists() else shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("找不到 FFmpeg，无法测量输出亮度。")
-    # Detect cuts on the decoded picture. Reduce full-size PQ MaxRGB tiles on
-    # the GPU, then expose the three RGB result planes to signalstats directly.
+    # Reduce full-size PQ MaxRGB tiles on the GPU and expose the three result
+    # planes to signalstats. mergeplanes creates fresh frames without scene tags.
     # gbrp stores G (minimum), B (mean), R (maximum), in that order.
     measurement_shader = ROOT / "shaders" / "Measure_MaxRGB.glsl"
     init = ["-init_hw_device", "vulkan=lf:,vendor_id=0x10de", "-filter_hw_device", "lf"]
     vf = (
-        "scdet=threshold=8,hwupload,"
+        "[measure]hwupload,"
         "libplacebo=w=ceil(iw/8):h=ceil(ih/8):format=gbrp16le:"
         "apply_dolbyvision=0:peak_detect=0:deband=0:dithering=none:"
         "color_primaries=bt2020:colorspace=gbr:color_trc=smpte2084:range=pc:custom_shader_path="
         + filter_path(measurement_shader)
         + ",hwdownload,format=gbrp16le,mergeplanes=map0p=0:map1p=1:map2p=2:format=yuv444p16le,"
-        "signalstats,metadata=mode=print:file=-:direct=1"
+        "signalstats,metadata=mode=print:file=-:direct=1[out]"
     )
-    frames = 0
-    start, length, minimum, maximum, total = 0, 0, 65535.0, 0.0, 0.0
-    scenes, fields = [], {}
+    # Analysis and cut detection share a decode. The two filter branches may
+    # run ahead of each other, so join by presentation-frame index after EOF.
+    # Three doubles per frame use about 8 MiB for four hours at 24 fps.
+    levels = array("d")
+    fields = {}
 
     def accept():
-        nonlocal frames, start, length, minimum, maximum, total
         if "frame" not in fields:
             return
-        if int(fields["frame"]) != frames:
+        if int(fields["frame"]) != len(levels) // 3:
             raise ValueError("亮度分析的帧序号不连续。")
-        if float(fields.get("lavfi.scd.score", 0)) >= 8 and length:
-            scenes.append(_scene(start, length, minimum, maximum, total))
-            start, length, minimum, maximum, total = frames, 0, 65535.0, 0.0, 0.0
-        minimum = min(minimum, float(fields["lavfi.signalstats.YMIN"]))
-        maximum = max(maximum, float(fields["lavfi.signalstats.VMAX"]))
-        total += float(fields["lavfi.signalstats.UAVG"])
-        length += 1
-        frames += 1
+        levels.extend(float(fields[k]) for k in (
+            "lavfi.signalstats.YMIN", "lavfi.signalstats.VMAX", "lavfi.signalstats.UAVG"
+        ))
 
     def parse_line(line):
         nonlocal fields
@@ -103,35 +100,38 @@ def measure_output(base_file, work_dir, run):
             accept()
             fields = {"frame": re.match(r"frame:(\d+)", line).group(1)}
         elif line.startswith(("lavfi.signalstats.YMIN=", "lavfi.signalstats.VMAX=",
-                              "lavfi.signalstats.UAVG=", "lavfi.scd.score=")):
+                              "lavfi.signalstats.UAVG=")):
             key, _, value = line.partition("=")
             fields[key] = value
 
-    run(
-        [
-            ffmpeg,
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            *init,
-            "-i",
-            str(base_file),
-            "-map",
-            "0:v:0",
-            "-an",
-            "-sn",
-            "-vf",
-            vf,
-            "-f",
-            "null",
-            "-",
-        ],
-        parse_line,
-        collect=False,
-    )
-    accept()
+    with tempfile.TemporaryDirectory(dir=work_dir, prefix="scene_cuts_") as folder:
+        marks = Path(folder) / "cuts.txt"
+        # scdet uses only luma on planar YUV. A compact RGB picture makes
+        # abrupt isoluminant colour edits measurable without another 4K copy.
+        # Pad each end so the centred three-frame median keeps the original
+        # frame numbers. Only the cut detector suppresses isolated flashes.
+        detector = (
+            "[0:v:0]split[measure][detect];[detect]"
+            "scale=w=min(iw\\,320):h=min(ih\\,180):force_original_aspect_ratio=decrease:"
+            "flags=area:in_color_matrix=bt2020:out_range=full,"
+            "format=gbrp,tpad=start=1:stop=1:start_mode=clone:stop_mode=clone,"
+            "tmedian=radius=1,format=rgb24,scdet=threshold=8,"
+            "metadata=mode=print:key=lavfi.scd.time:file="
+            + filter_path(marks) + ",nullsink;"
+        )
+        run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", *init,
+             "-i", str(base_file), "-filter_complex", detector + vf, "-map", "[out]",
+             "-an", "-sn", "-f", "null", "-"], parse_line, collect=False)
+        accept()
+        cuts = [int(n) for n in re.findall(r"^frame:(\d+)", marks.read_text(), re.MULTILINE)]
+    frames = len(levels) // 3
     if not frames:
         raise ValueError("没有可分析的输出画面。")
-    scenes.append(_scene(start, length, minimum, maximum, total))
+    starts = [0, *cuts, frames]
+    scenes = []
+    for start, end in zip(starts, starts[1:]):
+        if end <= start:
+            raise ValueError("分镜帧序号与亮度分析不一致。")
+        scene = memoryview(levels)[start * 3:end * 3]
+        scenes.append(_scene(start, end - start, min(scene[0::3]), max(scene[1::3]), sum(scene[2::3])))
     return scenes

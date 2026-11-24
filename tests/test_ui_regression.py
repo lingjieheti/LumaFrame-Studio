@@ -43,6 +43,22 @@ class ExportWindowTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertFalse(self.window.busy)
 
+    def test_native_hdr10_offers_picture_preserving_authoring(self):
+        info = dict(self.window.info, dv_profile=None, source_type="hdr10", can_keep7=False, profile="HDR10")
+        self.window.got_info(0, info, "")
+        self.assertEqual(self.window.targets.currentData(), "newdv")
+        self.assertEqual(self.window.modes.count(), 1)
+        self.assertEqual(self.window.modes.currentData(), "copy")
+        self.assertTrue(self.window.mapping_row.isHidden())
+
+    def test_compression_repair_is_optional_for_smaller_profile8_sources(self):
+        info = dict(self.window.info, dv_profile=8, width=1920, height=1080, can_keep7=False)
+        self.window.got_info(0, info, "")
+        self.assertEqual(self.window.modes.currentData(), "rtx")
+        self.assertGreater(self.window.modes.findData("rtx_compressed"), 0)
+        self.window.got_info(0, dict(info, width=3840, height=2160, can_copy8=True), "")
+        self.assertEqual(self.window.modes.findData("rtx_compressed"), -1)
+
     def test_existing_names_and_preview_keep_custom_destination(self):
         chosen = self.directory / "自选名称.mkv"
         chosen.write_bytes(b"original")

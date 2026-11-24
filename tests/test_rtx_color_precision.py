@@ -1,16 +1,34 @@
 """Check the actual FFmpeg conversions surrounding NVIDIA's packed RGB10 model."""
 
 from array import array
+import json
 from pathlib import Path
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from rtx_backend import pq_to_rgb10, rgb10_to_pq
+from ai import nvenc_command
 
 FFMPEG = ROOT / "bin" / "ffmpeg.exe"
+
+
+class CompressedSource(unittest.TestCase):
+    def test_worker_mode_is_explicit_and_incompatible_inputs_are_rejected(self):
+        def command(**options):
+            return nvenc_command("source", "result", 3840, 2160, "metadata", **options)
+
+        with patch("ai.nvenc_exe", return_value=Path(__file__)):
+            self.assertNotIn("compressed_source", json.loads(command(mode="rtx")[-1]))
+            options = json.loads(command(mode="rtx", compressed_source=True)[-1])
+            self.assertIs(options["compressed_source"], True)
+            for invalid in ({"mode": "nis"}, {"mode": "rtx", "sdr_to_hdr": True},
+                            {"mode": "rtx", "fel_input": (1920, 1080, 24)}):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    command(compressed_source=True, **invalid)
 
 
 @unittest.skipUnless(FFMPEG.is_file(), "requires the bundled Windows FFmpeg")

@@ -4,7 +4,7 @@
 
 [从官网下载](https://www.lingjie.cyou/projects/lumaframe-studio/) · [GitHub Releases](https://github.com/lingjieheti/LumaFrame-Studio/releases/latest) · [超分实测](docs/quality.md) · [双层画质验证](docs/profile7.md) · [赞助作者](https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md)
 
-**1.3.0 画质验证** 用两段 Netflix 开放 4K HDR 母版测试了无损和两档有损 1080p 片源。六组 RTX 输出的平均 HDR 色差均有下降，改善幅度随片源变化。报告列出每组结果、原码流保留条件和复算命令。[HDR 色差与母版对照](docs/quality-1.3.md)
+**1.4.0 画质验证** 有明显压缩痕迹的 1080p Profile 8.1 可以试用「压缩片源修复」。干净片源继续使用默认高码率 Ultra。符合条件的原生 4K HDR10 可在保留编码画面的同时生成杜比动态元数据。[1.4.0 画质与验证](docs/quality-1.4.md) · [1.3.0 的 HDR 母版对照](docs/quality-1.3.md)
 
 ![LumaFrame Studio 浅色工作台](docs/workspace-light.png)
 
@@ -27,6 +27,7 @@
 | Profile 7 MEL | 单层 Profile 8.1 | 使用 HDR10 基础层，转换原有动态元数据，按目标分辨率适配有效画面 |
 | 单层 HEVC Dolby Vision Profile 8.1 | Dolby Vision Profile 8.1 | 保留原动态元数据，按输出尺寸调整逐镜有效画面区域 |
 | 单层 HEVC Dolby Vision Profile 5 | Dolby Vision Profile 8.1 | 先重建 Profile 5 画面，再生成 HDR10 兼容基础层并转换原杜比元数据 |
+| 已达目标画幅的静态 HDR10 HEVC Main 10 | Dolby Vision Profile 8.1 | 保留原始编码画面，沿用 ST 2086 母版亮度，逐镜生成新元数据 |
 | 普通 BT.709 SDR | HDR10 | 重建 BT.2020/PQ 画面，自动扩展高光，目标峰值 1000 尼特 |
 | 普通 BT.709 SDR | Dolby Vision Profile 8.1 | 先制作 HDR 画面，再估算各镜头亮度并生成新的动态元数据 |
 
@@ -69,6 +70,6 @@ Windows 安装包使用 Inno Setup 6。可先运行桌面冒烟检查，再打�
 .\LumaFrameStudio.exe --export movie.mkv --target preserve --mode neural --output movie-4K.mkv --result result.json
 ```
 
-目标值为 `keep7`（原生 4K 双层原样保留）、`preserve`（保留或转换到 Profile 8.1）、`hdr10`、`newdv`。模式值为 `neural`、`rtx`、`reference`、适用于 Profile 8.1 的 `quality`，以及供尺寸已经匹配的 Profile 8.1 使用的 `copy`。附加 `--sample` 可试转片段。省略目标时，符合原生双层条件的片源优先保留 Profile 7。SDR 输入可用 `--sdr-mapping reference` 选择 203 尼特参考白，或使用默认 `expand` 扩展高光。
+目标值为 `keep7`（原生 4K 双层原样保留）、`preserve`（保留或转换到 Profile 8.1）、`hdr10`、`newdv`。模式值为 `neural`、`rtx`、`reference`、适用于 Profile 8.1 的 `quality` 和手选的压缩片源修复 `rtx_compressed`。`copy` 可无损封装尺寸匹配的 Profile 8.1，也可在原生静态 HDR10 选择 `newdv` 时沿用原编码画面。附加 `--sample` 可试转片段。省略目标时，符合原生双层条件的片源优先保留 Profile 7。SDR 输入可用 `--sdr-mapping reference` 选择 203 尼特参考白，或使用默认 `expand` 扩展高光。
 
 [引擎与设计取舍](docs/engineering.md) · [第三方许可与源码](THIRD_PARTY.md)

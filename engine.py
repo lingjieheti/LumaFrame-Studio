@@ -274,6 +274,13 @@ def _describe(path, data):
                 raise ValueError("杜比视界片源需使用方形像素，以保持有效画面与元数据一致。")
             info["can_copy8"] = p == 8 and (w, h) == (target_w, target_h)
             info["source_type"] = "dv"
+        elif v.get("color_transfer") == "smpte2084":
+            if (v.get("codec_name") != "hevc" or v.get("profile") != "Main 10" or v.get("pix_fmt") != "yuv420p10le"
+                    or (v.get("color_primaries"), v.get("color_space"), v.get("color_range"))
+                    != ("bt2020", "bt2020nc", "tv") or sar != 1
+                    or (w, h) != (target_w, target_h) or w > 3840):
+                raise ValueError("HDR10 原画面制作需要已达目标尺寸的 HEVC Main 10、方形像素、有限范围 BT.2020/PQ 片源。")
+            info.update(source_type="hdr10", profile="HDR10 · 静态 PQ")
         else:
             p = v.get("pix_fmt", "")
             if p not in {
@@ -336,7 +343,7 @@ def _inspect(path, data, run, *, sample_layers=True):
                 info["profile"] += f" · {layer}"
             except (ValueError, RuntimeError) as exc:
                 info.update(supported=False, can_keep7=False, reason=str(exc))
-    if info["source_type"] == "sdr":
+    if info["source_type"] in ("sdr", "hdr10"):
         # Transport streams can retain in-band RPU even when their VUI says BT.709.
         idx = _video(data)["index"]
         records = run(
@@ -365,8 +372,14 @@ def _inspect(path, data, run, *, sample_layers=True):
                 source_type="other",
                 profile="",
                 assumptions=[],
-                reason="帧内 HDR 元数据与 SDR 色彩标记或推定的 BT.709 冲突，请核对片源。",
+                reason=("片源已有动态 HDR 元数据，无法按静态 HDR10 制作。"
+                        if info["source_type"] == "hdr10" else
+                        "帧内 HDR 元数据与 SDR 色彩标记或推定的 BT.709 冲突，请核对片源。"),
             )
+        elif info["source_type"] == "hdr10" and "mastering display" not in records.lower() and not any(
+            s.get("side_data_type") == "Mastering display metadata" for s in _video(data).get("side_data_list", [])
+        ):
+            info.update(supported=False, reason="HDR10 原片缺少可读取的 ST 2086 母版显示信息。")
     return info
 
 
@@ -567,6 +580,7 @@ def _gpu_command(source, output, info, mode, target, rpu, master, cll, *, fel_in
         sdr_to_hdr=target != "preserve",
         sdr_mapping=info.get("sdr_mapping", "expand"),
         fel_input=fel_input,
+        compressed_source=info.get("compressed_source", False),
     )
 
 
@@ -905,7 +919,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
         raise FileExistsError("目标文件已存在，请选择新的输出文件名。")
     if dest.suffix.lower() != ".mkv" or not dest.parent.is_dir():
         raise ValueError("请选择现有文件夹中的 .mkv 输出文件。")
-    if mode not in {"quality", "reference", "neural", "rtx", "copy"} or target not in {
+    if mode not in {"quality", "reference", "neural", "rtx", "rtx_compressed", "copy"} or target not in {
         "preserve",
         "keep7",
         "hdr10",
@@ -918,11 +932,20 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
     info = _inspect(source, data, run, sample_layers=False)
     if not info["supported"]:
         raise ValueError(info["reason"])
+    if mode == "rtx_compressed":
+        if (info["dv_profile"] != 8 or target != "preserve" or
+                (info["width"], info["height"]) == (info["target_width"], info["target_height"])):
+            raise ValueError("压缩片源修复仅适用于需要放大的 Dolby Vision Profile 8.1。")
+        info["compressed_source"] = True
+        mode = "rtx"
     if sdr_mapping not in {"expand", "reference"} or (sdr_mapping != "expand" and info["source_type"] != "sdr"):
         raise ValueError("亮度映射仅适用于 SDR 片源，请选择有效的映射方式。")
     info["sdr_mapping"] = sdr_mapping
     native = target == "keep7"
-    copy_video = mode == "copy"
+    author_native = info["source_type"] == "hdr10"
+    if author_native and (mode != "copy" or target != "newdv"):
+        raise ValueError("原生 HDR10 请选择生成杜比视界并保留原始编码画面。")
+    copy_video = mode == "copy" and not author_native
     if copy_video and (target != "preserve" or not info["can_copy8"]):
         raise ValueError("原码流无损封装需要尺寸已匹配的 Profile 8.1 片源。")
     if native and not info["can_keep7"]:
@@ -1000,7 +1023,21 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
         signatures = None
         picture_signature = None
         base_layer_copied = False
-        if info["dv_profile"] == 7:
+        generation_levels = {}
+        if author_native:
+            from hdr10 import NativeMetadata
+            from profile7 import signature
+
+            progress(5, "读取原始 HDR10 编码画面与母版显示信息")
+            _extract(source, video["index"], encoded, run)
+            metadata = NativeMetadata()
+            picture_signature = signature(encoded, cancel, inspect_unit=metadata.observe)
+            if picture_signature[0] != len(times):
+                raise ValueError("HDR10 基础层图像数与显示时间戳数不符。")
+            generation_levels = metadata.level6()
+            master, cll = _static_hdr(source, video, run)
+            base_layer_copied = streamed = True
+        elif info["dv_profile"] == 7:
             import profile7
 
             progress(4, "拆分并逐帧核对 Profile 7 基础层、增强层与 RPU")
@@ -1185,7 +1222,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
 
             progress(73, "测量新 HDR 画面的逐镜亮度")
             measurements = measure_output(encoded, scratch, run)
-            meta = dovi.generate_rpu_from_measurements(measurements, rpu, scratch, run)
+            meta = dovi.generate_rpu_from_measurements(measurements, rpu, scratch, run, **generation_levels)
             if meta["frame_count"] != len(times):
                 raise ValueError("新生成的 RPU 帧数与原视频不一致。")
         if target not in {"hdr10", "keep7"} and not has_rpu and not copy_video:
@@ -1331,7 +1368,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
             width=info["target_width"],
             height=info["target_height"],
             target=target,
-            mode=mode,
+            mode="rtx_compressed" if info.get("compressed_source") else mode,
             rpu_sha256=digest,
             verified=True,
             hevc_tier=tier,

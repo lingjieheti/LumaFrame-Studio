@@ -18,16 +18,22 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 from urllib.request import Request, urlopen
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import ai
 import dovi
 import engine
 import hdr
 
 BASE = "https://s3.amazonaws.com/download.opencontent.netflix.com/TechblogAssets/"
+MERIDIAN = (
+    BASE + "Meridian/MERIDIAN_SHR_C_EN-XX_US-NR_51_LTRT_UHD_ML7_SL4_20160915_OV/"
+    "MER_SHR_C_EN-XX_US-NR_51_LTRT_UHD_ML7_SL4_20160915_OV_00.mxf"
+)
 SCENES = {
     "sparks": (
         BASE + "Sparks/Sparks_DolbyVision_P3D65_PQ_5994fps_4096x2160_LtRt_IMF_20170214/"
@@ -37,17 +43,18 @@ SCENES = {
         2356,
     ),
     "meridian": (
-        BASE + "Meridian/MERIDIAN_SHR_C_EN-XX_US-NR_51_LTRT_UHD_ML7_SL4_20160915_OV/"
-        "MER_SHR_C_EN-XX_US-NR_51_LTRT_UHD_ML7_SL4_20160915_OV_00.mxf",
+        MERIDIAN,
         17_000_625_208,
         17_211_500_000,
         5662,
     ),
+    "meridian-holdout": (MERIDIAN, 27_000_141_597, 27_200_264_319, 8660),
 }
 COUNT = 60
 FIRST_FRAME_SHA256 = {
     "sparks": "bee22c9a464763c82ff36eed8ddd1046bad689c6b0792a6b57fe16169693765a",
     "meridian": "56b8334f8a7cc7bf29249bf02e1395fd1c6bc63183bdf03ef624de792d767f3d",
+    "meridian-holdout": "e6f4c1d77a0ee6f2387fe5078d4f97c2137786c05a4de01858b55927969f8f8a",
 }
 
 
@@ -118,8 +125,15 @@ def yuv_frames(path):
                 p.kill()
 
 
+def luma_gradients(frame):
+    y = frame[:3840 * 2160].reshape(2160, 3840)
+    center = y[:-1:2, :-1:2]
+    return np.stack((y[:-1:2, 1::2] - center, y[1::2, :-1:2] - center))
+
+
 def compare(truth, output, run):
     errors, motion_errors, previous = np.zeros(3), 0.0, None
+    edge_error, edge_samples = 0.0, 0
     pixels = 3840 * 2160
     count = 0
     for count, (a, b) in enumerate(zip(yuv_frames(truth), yuv_frames(output), strict=True), 1):
@@ -127,6 +141,15 @@ def compare(truth, output, run):
         for i, plane in enumerate(planes):
             errors[i] += np.square(plane, dtype=np.float32).mean(dtype=np.float64)
         residual = planes[0]
+        if (count - 1) % 5 == 0:
+            # At every other pixel sample horizontal and vertical first differences.
+            # Select edges on the master, so over-sharpening cannot select its own test pixels.
+            reference = luma_gradients(a)
+            magnitude = np.abs(reference).sum(axis=0)
+            strongest = magnitude >= max(1, np.percentile(magnitude, 90))
+            error = (luma_gradients(b) - reference)[:, strongest]
+            edge_error += np.square(error, dtype=np.float32).sum(dtype=np.float64)
+            edge_samples += error.size
         if previous is not None:
             motion_errors += np.abs(residual - previous).mean()
         previous = residual
@@ -157,6 +180,7 @@ def compare(truth, output, run):
         cr_psnr_db=float(psnr[2]),
         y_ssim=ssim,
         delta_y_mae=motion_errors / (count - 1),
+        strong_edge_gradient_rmse=float(np.sqrt(edge_error / edge_samples)) if edge_samples else None,
     )
 
 
@@ -168,9 +192,15 @@ def main():
         "--run-name", default="", help="Optional filename prefix for additional comparison runs"
     )
     parser.add_argument("--modes", nargs="+", default=["reference", "quality", "neural", "rtx"])
+    parser.add_argument("--rtx-quality", type=float, metavar="0..51",
+                        help="Override only the RTX delivery encoder's VBR quality in this experiment.")
     parser.add_argument("--input-crf", type=int, choices=range(1, 52), metavar="1..51",
                         help="Apply an additional, lossy HEVC encode to the 1080p test input.")
     args = parser.parse_args()
+    if args.rtx_quality is not None and (
+        not 0 <= args.rtx_quality <= 51 or set(args.modes) - {"rtx", "rtx_compressed"}
+    ):
+        parser.error("--rtx-quality requires RTX modes and a value between 0 and 51")
     if not re.fullmatch("[a-zA-Z0-9_-]*", args.run_name):
         parser.error("--run-name accepts letters, digits, hyphen and underscore")
     prefix = args.run_name + "-" if args.run_name else ""
@@ -266,7 +296,17 @@ def main():
         start = time.perf_counter()
         if dest.exists():
             raise FileExistsError(f"Already rendered: {dest}. Pick another folder or a new mode.")
-        engine.render(source, dest, mode, lambda *_: None, threading.Event())
+        if args.rtx_quality is None:
+            engine.render(source, dest, mode, lambda *_: None, threading.Event())
+        else:
+            default_command = ai.nvenc_command
+
+            def rate_control(*positional, **options):
+                options["quality"] = args.rtx_quality
+                return default_command(*positional, **options)
+
+            with patch.object(ai, "nvenc_command", rate_control):
+                engine.render(source, dest, mode, lambda *_: None, threading.Event())
         elapsed = time.perf_counter() - start
         results[mode] = dict(
             wall_seconds=elapsed, bytes=dest.stat().st_size, **compare(truth, dest, run)

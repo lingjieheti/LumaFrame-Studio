@@ -261,7 +261,7 @@ def prepare(
     return base, el, rpu, layer, frames
 
 
-def signature(path, cancel, *, ignore_rpu=False):
+def signature(path, cancel, *, ignore_rpu=False, inspect_unit=None):
     """Fingerprint coded pictures/SEI in order, and unique decoder parameter sets.
 
     Access unit delimiters and repeated identical VPS/SPS/PPS can legitimately
@@ -289,6 +289,8 @@ def signature(path, cancel, *, ignore_rpu=False):
         if len(unit) < 2:
             continue
         kind = (unit[0] >> 1) & 0x3F
+        if inspect_unit is not None:
+            inspect_unit(kind, unit)
         if kind == 62 and ignore_rpu:
             # MEL conversion replaces the RPU while preserving the base picture.
             # The converted RPU is separately verified in presentation order.

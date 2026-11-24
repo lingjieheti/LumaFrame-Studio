@@ -62,7 +62,7 @@ import glass
 from glass import ASSETS, GlassButton, Material, Rail, Stage, Select, ink
 from material_sample import MaterialSample
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 REPO = "https://github.com/lingjieheti/LumaFrame-Studio"
 SPONSOR = "https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md"
 TARGETS = {
@@ -74,6 +74,7 @@ TARGETS = {
 MODES = {
     "copy": "无损封装 · 原始单层码流",
     "rtx": "NVIDIA RTX AI · 高码率 Ultra",
+    "rtx_compressed": "NVIDIA RTX · 压缩片源修复",
     "neural": "FSRCNNX · 神经网络",
     "reference": "Spline36 · 保真缩放",
     "quality": "NVIDIA NIS · 快速缩放",
@@ -180,7 +181,7 @@ def poster_frame(path, info, cancel):
     if info.get("dv_profile") in (5, 7) or cancel.is_set():
         return b""
     vf = "scale=640:-2"
-    if info["source_type"] == "dv":
+    if info["source_type"] in ("dv", "hdr10"):
         vf = "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=mobius,zscale=p=bt709:t=bt709:m=bt709:r=limited,format=yuv420p,scale=640:-2"
     timestamp = min(max(info["duration"] * 0.10, 0), 25)
     args = [
@@ -775,7 +776,7 @@ class Studio(QMainWindow):
             self.modes.clear()
             self.hint.hide()
             return
-        keys = ["hdr10", "newdv"] if info.get("source_type") == "sdr" else ["preserve"]
+        keys = {"sdr": ["hdr10", "newdv"], "hdr10": ["newdv"]}.get(info.get("source_type"), ["preserve"])
         if info.get("can_keep7"):
             keys.insert(0, "keep7")
         for key in keys:
@@ -807,12 +808,18 @@ class Studio(QMainWindow):
                 keys = [key for key in keys if key != "neural"]
             if ratio <= 1.0:
                 keys = ["reference"]
+            elif k == "preserve" and self.info.get("dv_profile") == 8:
+                keys.insert(1, "rtx_compressed")
             if k == "preserve" and self.info.get("can_copy8"):
                 keys.insert(0, "copy")
+            if self.info.get("source_type") == "hdr10":
+                keys = ["copy"]
         for key in keys:
             name = MODES[key]
             if k == "keep7":
                 name = "无损封装 · 原始双层码流"
+            elif k == "newdv" and key == "copy":
+                name = "保留 HDR10 原画面 · 生成动态元数据"
             elif (k == "preserve" and key == "reference" and self.info.get("can_keep7")
                   and self.info.get("profile", "").endswith(" · MEL")):
                 name = "保留原始基础层 · 转换杜比元数据"
@@ -829,6 +836,7 @@ class Studio(QMainWindow):
         tips = {
             "copy": "片源已达到输出尺寸，直接保留原始 HEVC 画面、HDR 信号和杜比动态元数据。",
             "rtx": "10 位 AI 超分与高码率编码，适合优质电影片源。首次使用需下载约 416 MiB 的 NVIDIA 运行库。",
+            "rtx_compressed": "适合有压缩噪声的片源。轻度时空降噪后进行 RTX 超分。颗粒和文件大小可能变化，可先试转。",
             "neural": "使用 NVIDIA GPU 增强亮度细节，以 x265 慢速 CRF 14 编码。",
             "reference": "使用高位深 Spline36 与 x265 慢速编码，适合保留胶片纹理。",
             "quality": "采用 NVIDIA Image Scaling 与硬件编码，适合快速导出。",
@@ -843,6 +851,8 @@ class Studio(QMainWindow):
                 text = "全片确认为 MEL 时，沿用原始 HEVC 基础层，并将逐帧杜比元数据转换为 Profile 8.1。"
             if "FEL" in self.info.get("profile", ""):
                 text += " 重建的 12 位画面逐帧送入后续处理，请为分层码流和成片封装预留磁盘空间。"
+        elif self.info and self.info.get("source_type") == "hdr10":
+            text = "沿用原始 HDR10 画面和母版亮度，逐镜测量生成杜比动态元数据。"
         elif self.targets.currentData() == "newdv":
             text += " 按新画面测量生成杜比动态元数据。"
         self.hint.setText(text)
@@ -1114,12 +1124,12 @@ def export_command(argv):
                 if not data["supported"]:
                     raise ValueError(data["reason"])
                 if not options.target:
-                    options.target = "keep7" if data.get("can_keep7") else (
-                        "hdr10" if data["source_type"] == "sdr" else "preserve"
-                    )
+                    options.target = "keep7" if data.get("can_keep7") else {
+                        "sdr": "hdr10", "hdr10": "newdv"
+                    }.get(data["source_type"], "preserve")
                 if not options.mode:
                     native = (data["width"], data["height"]) == (data["target_width"], data["target_height"])
-                    if options.target == "preserve" and data.get("can_copy8"):
+                    if data["source_type"] == "hdr10" or (options.target == "preserve" and data.get("can_copy8")):
                         options.mode = "copy"
                     else:
                         options.mode = "reference" if native else "rtx"
