@@ -39,6 +39,7 @@ def nvenc_command(
     hw_decode=True,
     sdr_to_hdr=False,
     fel_input=None,
+    sdr_mapping="expand",
 ):
     """Return argv. `source` is a verified limited-range BT.2020/PQ main layer."""
     width, height = int(width), int(height)
@@ -61,6 +62,7 @@ def nvenc_command(
             mastering=mastering,
             max_cll=max_cll,
             sdr_to_hdr=sdr_to_hdr,
+            sdr_mapping=sdr_mapping,
         )
         if fel_input is not None:
             iw, ih, fps = fel_input

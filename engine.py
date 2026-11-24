@@ -226,6 +226,7 @@ def _describe(path, data):
         profile="",
         dv_profile=None,
         can_keep7=False,
+        can_copy8=False,
         el_index=data.get("_p7_el"),
         duration=float(data.get("format", {}).get("duration") or 0),
         source_type="other",
@@ -271,6 +272,7 @@ def _describe(path, data):
                 dovi.validate_profile(v)
             if sar != 1:
                 raise ValueError("杜比视界片源需使用方形像素，以保持有效画面与元数据一致。")
+            info["can_copy8"] = p == 8 and (w, h) == (target_w, target_h)
             info["source_type"] = "dv"
         else:
             p = v.get("pix_fmt", "")
@@ -545,7 +547,7 @@ def _check_dv_tier(path, video, config, cap, run):
     if not 1 <= level <= len(groups):
         raise ValueError(f"无法核验杜比视界等级 {level}。")
     width, main_rate, high_rate = groups[level - 1]
-    if video["width"] > width or cap > (high_rate if high else main_rate) * 1000:
+    if video["width"] > width or (cap is not None and cap > (high_rate if high else main_rate) * 1000):
         raise ValueError("输出信令的级别或档位与实际画宽、编码码率约束不符。")
     return ("High" if high else "Main"), level
 
@@ -563,6 +565,7 @@ def _gpu_command(source, output, info, mode, target, rpu, master, cll, *, fel_in
         mastering=master, max_cll=cll,
         hw_decode=min(info["width"], info["height"]) >= 128,
         sdr_to_hdr=target != "preserve",
+        sdr_mapping=info.get("sdr_mapping", "expand"),
         fel_input=fel_input,
     )
 
@@ -585,7 +588,8 @@ def _software_command(source, out, info, video, mode, target, master, cll):
     else:
         from hdr import sdr_filter
 
-        init_args, vf = sdr_filter(info["width"], info["height"], w, h, mode)
+        init_args, vf = sdr_filter(info["width"], info["height"], w, h, mode,
+                                   mapping=info.get("sdr_mapping", "expand"))
         full = video.get("color_range") == "pc" or video["pix_fmt"].startswith("yuvj")
         vf = (
             "setparams=range="
@@ -893,7 +897,7 @@ def _verify_other(source, output, original, result, chapter_streams, explicit_ch
             raise ValueError("章节名称校验失败。")
 
 
-def render(path, destination, mode, progress, cancel, *, target="preserve"):
+def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_mapping="expand"):
     source = Path(path).resolve(strict=True)
     before = source.stat()
     dest = Path(destination).resolve()
@@ -901,7 +905,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
         raise FileExistsError("目标文件已存在，请选择新的输出文件名。")
     if dest.suffix.lower() != ".mkv" or not dest.parent.is_dir():
         raise ValueError("请选择现有文件夹中的 .mkv 输出文件。")
-    if mode not in {"quality", "reference", "neural", "rtx"} or target not in {
+    if mode not in {"quality", "reference", "neural", "rtx", "copy"} or target not in {
         "preserve",
         "keep7",
         "hdr10",
@@ -914,7 +918,13 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
     info = _inspect(source, data, run, sample_layers=False)
     if not info["supported"]:
         raise ValueError(info["reason"])
+    if sdr_mapping not in {"expand", "reference"} or (sdr_mapping != "expand" and info["source_type"] != "sdr"):
+        raise ValueError("亮度映射仅适用于 SDR 片源，请选择有效的映射方式。")
+    info["sdr_mapping"] = sdr_mapping
     native = target == "keep7"
+    copy_video = mode == "copy"
+    if copy_video and (target != "preserve" or not info["can_copy8"]):
+        raise ValueError("原码流无损封装需要尺寸已匹配的 Profile 8.1 片源。")
     if native and not info["can_keep7"]:
         raise ValueError("双层原样保留仅适用于原生 4K Profile 7 片源。")
     if native:
@@ -945,7 +955,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
     video = _video(data)
     original = _mkv_inventory(source, run)
     copy_container = (
-        native and info["el_index"] is None and original["container"].get("type") == "Matroska"
+        (native or copy_video) and info["el_index"] is None and original["container"].get("type") == "Matroska"
     )
     if not original.get("container", {}).get("supported") or sum(
         t["type"] == "video" for t in original.get("tracks", [])
@@ -988,6 +998,8 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
         picture, picture_video = source, video
         streamed = False
         signatures = None
+        picture_signature = None
+        base_layer_copied = False
         if info["dv_profile"] == 7:
             import profile7
 
@@ -1059,6 +1071,16 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                         progress,
                         encoder_command=command,
                     )
+                elif layer == "MEL" and mode == "reference" and info["can_keep7"]:
+                    # MEL has no picture residual. Mode 2 above keeps its mapping
+                    # and changes the RPU to P8.1; the HDR10 base stays bit exact.
+                    picture_signature = profile7.signature(base, cancel, ignore_rpu=True)
+                    if picture_signature[0] != len(times):
+                        raise ValueError("MEL 基础层的编码图像数与原片显示帧数不符。")
+                    encoded = base
+                    base_layer_copied = True
+                    streamed = True
+                    progress(72, "已保留 MEL 原始基础层，正在转换逐帧动态元数据")
                 else:
                     picture = scratch / "base.mkv"
                     run(
@@ -1074,12 +1096,16 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                     )
                 if not streamed:
                     picture_video = _video(_probe(picture, run))
-            base.unlink()
+            if base != encoded:
+                base.unlink()
             el.unlink()
         elif target == "preserve":
             progress(5, "提取杜比视界元数据并换算有效画面尺寸")
-            source_es = scratch / "original.hevc"
-            _extract(source, video["index"], source_es, run)
+            # dovi_tool reads single-track Matroska directly. A native MKV
+            # therefore needs no temporary copy of the full elementary stream.
+            source_es = source if copy_container else scratch / "original.hevc"
+            if source_es != source:
+                _extract(source, video["index"], source_es, run)
             if info["dv_profile"] == 5:
                 from profile5 import prepare_profile5_rpu
 
@@ -1096,7 +1122,15 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                 scratch,
                 run,
             )
-            source_es.unlink()
+            if copy_video and not copy_container:
+                from profile7 import signature
+
+                encoded = source_es
+                picture_signature = signature(encoded, cancel)
+                if picture_signature[0] != len(times):
+                    raise ValueError("原片编码图像数和显示帧数不一致。")
+            elif source_es != source:
+                source_es.unlink()
             if meta["frame_count"] != len(times):
                 raise ValueError("原片 RPU 数量与视频显示帧数不符。")
             master, cll = _static_hdr(source, video, run)
@@ -1110,10 +1144,12 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
                 "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)",
                 None,
             )
-        if not native and not streamed:
+        if not native and not copy_video and not streamed:
             progress(12, "生成 4K 10 位 PQ 视频")
         has_rpu = target == "preserve" and mode in {"quality", "rtx"}
-        if native:
+        if copy_video:
+            progress(74, "已保留原始单层视频与逐帧动态元数据")
+        elif native:
             progress(74, "已保留原始双层视频")
         elif not streamed and (has_rpu or mode == "rtx"):
             from ai import rtx_status
@@ -1152,7 +1188,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
             meta = dovi.generate_rpu_from_measurements(measurements, rpu, scratch, run)
             if meta["frame_count"] != len(times):
                 raise ValueError("新生成的 RPU 帧数与原视频不一致。")
-        if target not in {"hdr10", "keep7"} and not has_rpu:
+        if target not in {"hdr10", "keep7"} and not has_rpu and not copy_video:
             progress(81, "写入逐帧杜比视界元数据")
             injected = scratch / "with-rpu.hevc"
             run([dovi.find_dovi_tool(), "inject-rpu", "-i", encoded, "-r", rpu, "-o", injected])
@@ -1198,9 +1234,16 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
             cfg = profile7.config(out_video)
             profile7.validate_base(out_video, cfg)
             dv_level = cfg.get("dv_level")
+        elif copy_video:
+            cfg = dovi.validate_profile(out_video)
+            dv_level = cfg["dv_level"]
+            if dv_level != dovi.validate_profile(video)["dv_level"]:
+                raise ValueError("无损封装后杜比视界等级发生变化。")
         elif target != "hdr10":
             cfg = dovi.validate_profile(out_video)
-            cap = min(60000, _vbv_limit(info)) if mode == "quality" else _vbv_limit(info)
+            cap = None if base_layer_copied else _vbv_limit(info)
+            if mode == "quality":
+                cap = min(60000, cap)
             tier, dv_level = _check_dv_tier(muxed, out_video, cfg, cap, run)
         elif any("dv_profile" in s for s in out_video.get("side_data_list", [])):
             raise ValueError("HDR10 输出意外携带杜比视界配置。")
@@ -1234,7 +1277,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
         digest = None
         if copy_container:
             if _hash_container(muxed, cancel, progress) != container_digest:
-                raise ValueError("双层 MKV 整文件 SHA-256 回读不一致。")
+                raise ValueError("原样保留的 MKV 整文件 SHA-256 回读不一致。")
             digest = dovi._digest(rpu)
         elif native:
             progress(95, "逐层复核基础层、增强层和原始动态元数据")
@@ -1261,6 +1304,13 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
             ):
                 raise ValueError("成片 BL、EL 或原始 RPU 字节校验失败。")
         elif target != "hdr10":
+            if copy_video or base_layer_copied:
+                from profile7 import signature
+
+                readback = scratch / "readback.hevc"
+                _extract(muxed, out_video["index"], readback, run)
+                if signature(readback, cancel, ignore_rpu=base_layer_copied) != picture_signature:
+                    raise ValueError("无损封装后的 HEVC 编码画面、参数集或附加数据发生变化。")
             progress(95, "逐帧复核最终文件内的 RPU")
             verification = dovi.verify_rpu(rpu, muxed, scratch, run)
             digest = verification["rpu_sha256"]
@@ -1297,6 +1347,12 @@ def render(path, destination, mode, progress, cancel, *, target="preserve"):
             )
         if signatures:
             result.update(bl_sha256=signatures[0][1], el_sha256=signatures[1][1])
+        if base_layer_copied:
+            result.update(base_layer_copied=True, bl_sha256=picture_signature[1])
+        if copy_video and picture_signature:
+            result["video_sha256"] = picture_signature[1]
+        if info["source_type"] == "sdr":
+            result["sdr_mapping"] = sdr_mapping
         if container_digest:
             result["container_sha256"] = container_digest
     progress(100, "导出与校验均已完成")

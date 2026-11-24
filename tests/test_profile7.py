@@ -75,6 +75,11 @@ class DualLayerChecks(unittest.TestCase):
             self.assertEqual(baseline[0], 2)
             self.assertNotEqual(baseline, write(path, [2, 1], 33))
             self.assertNotEqual(baseline, write(path, [1, 2], 34))
+            mel = profile7.signature(path, None, ignore_rpu=True)
+            write(path, [1, 2], 35)
+            self.assertEqual(mel, profile7.signature(path, None, ignore_rpu=True))
+            write(path, [2, 1], 35)
+            self.assertNotEqual(mel, profile7.signature(path, None, ignore_rpu=True))
 
 
 if __name__ == "__main__":

@@ -4,6 +4,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SHADER = ROOT / "shaders" / "FSRCNNX_x2_16-0-4-1.glsl"
+RGB16_TO_PQ10 = (
+    "hwdownload,format=gbrp16le,zscale=matrixin=gbr:matrix=bt2020nc:rangein=full:"
+    "range=limited:chromal=left:dither=ordered,format=yuv420p10le"
+)
 
 
 def filter_path(path):
@@ -14,22 +18,23 @@ def filter_path(path):
     return "".join("\\" + c if c in "\\'[],;" else c for c in value)
 
 
-def gpu_filter(width, height, target_width, target_height, *, neural, inverse, shader_override=None):
+def gpu_filter(width, height, target_width, target_height, *, neural, inverse, shader_override=None,
+               output_rgb=False):
     init = ["-init_hw_device", "vulkan=lf:,vendor_id=0x10de", "-filter_hw_device", "lf"]
     params = [
         f"w={int(target_width)}",
         f"h={int(target_height)}",
-        "format=yuv420p10le",
-        "colorspace=bt2020nc",
+        "format=gbrp16le",
+        "colorspace=gbr",
         "color_primaries=bt2020",
         "color_trc=smpte2084",
-        "range=tv",
+        "range=pc",
         "apply_dolbyvision=0",
         "deband=0",
         "upscaler=spline36",
         "antiringing=0.75",
         "peak_detect=0",
-        "dithering=blue",
+        "dithering=none",
         "dither_temporal=0",
     ]
     if shader_override is not None:
@@ -40,7 +45,8 @@ def gpu_filter(width, height, target_width, target_height, *, neural, inverse, s
         params.append("custom_shader_path=" + filter_path(SHADER))
     if inverse:
         params.extend(["tonemapping=bt.2446a", "inverse_tonemapping=1"])
-    vf = "hwupload,libplacebo=" + ":".join(params) + ",hwdownload,format=yuv420p10le"
+    finish = "hwdownload,format=gbrp16le" if output_rgb else RGB16_TO_PQ10
+    vf = "hwupload,libplacebo=" + ":".join(params) + "," + finish
     return init, vf
 
 

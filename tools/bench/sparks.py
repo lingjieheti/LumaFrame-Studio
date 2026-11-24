@@ -14,6 +14,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -81,7 +82,7 @@ def download_frames(folder, asset, first, last, start):
         (folder / f"frame-{i:03}.j2c").write_bytes(block[a:end])
 
 
-def y_frames(path):
+def yuv_frames(path):
     command = [
         engine._tool("ffmpeg"),
         "-nostdin",
@@ -89,10 +90,14 @@ def y_frames(path):
         "error",
         "-i",
         str(path),
-        "-vf",
-        "extractplanes=y",
+        "-map",
+        "0:v:0",
+        "-fps_mode",
+        "passthrough",
+        "-enc_time_base",
+        "1/60000",
         "-pix_fmt",
-        "gray10le",
+        "yuv420p10le",
         "-f",
         "rawvideo",
         "-",
@@ -100,22 +105,28 @@ def y_frames(path):
     with subprocess.Popen(command, stdout=subprocess.PIPE) as p:
         try:
             while True:
-                buf = p.stdout.read(3840 * 2160 * 2)
+                buf = p.stdout.read(3840 * 2160 * 3)
                 if not buf:
                     break
+                if len(buf) != 3840 * 2160 * 3:
+                    raise ValueError("Incomplete 4K YUV frame")
                 yield np.frombuffer(buf, dtype="<u2").astype(np.int16)
             if p.wait() != 0:
-                raise RuntimeError("Failed to read Y' samples")
+                raise RuntimeError("Failed to read 10-bit 4:2:0 samples")
         finally:
             if p.poll() is None:
                 p.kill()
 
 
 def compare(truth, output, run):
-    errors, motion_errors, previous = 0.0, 0.0, None
-    for count, (a, b) in enumerate(zip(y_frames(truth), y_frames(output), strict=True), 1):
-        residual = b - a
-        errors += np.square(residual, dtype=np.float64).mean()
+    errors, motion_errors, previous = np.zeros(3), 0.0, None
+    pixels = 3840 * 2160
+    count = 0
+    for count, (a, b) in enumerate(zip(yuv_frames(truth), yuv_frames(output), strict=True), 1):
+        planes = np.split(b - a, (pixels, pixels + pixels // 4))
+        for i, plane in enumerate(planes):
+            errors[i] += np.square(plane, dtype=np.float32).mean(dtype=np.float64)
+        residual = planes[0]
         if previous is not None:
             motion_errors += np.abs(residual - previous).mean()
         previous = residual
@@ -139,8 +150,11 @@ def compare(truth, output, run):
         ]
     )
     ssim = float(re.findall(r"SSIM Y:([\d.]+)", stats)[-1])
+    psnr = 10 * np.log10(1023**2 / (errors / count))
     return dict(
-        y_psnr_db=float(10 * np.log10(1023**2 / (errors / count))),
+        y_psnr_db=float(psnr[0]),
+        cb_psnr_db=float(psnr[1]),
+        cr_psnr_db=float(psnr[2]),
         y_ssim=ssim,
         delta_y_mae=motion_errors / (count - 1),
     )
@@ -154,6 +168,8 @@ def main():
         "--run-name", default="", help="Optional filename prefix for additional comparison runs"
     )
     parser.add_argument("--modes", nargs="+", default=["reference", "quality", "neural", "rtx"])
+    parser.add_argument("--input-crf", type=int, choices=range(1, 52), metavar="1..51",
+                        help="Apply an additional, lossy HEVC encode to the 1080p test input.")
     args = parser.parse_args()
     if not re.fullmatch("[a-zA-Z0-9_-]*", args.run_name):
         parser.error("--run-name accepts letters, digits, hyphen and underscore")
@@ -229,6 +245,21 @@ def main():
         engine._extract(low, 0, raw, run)
         run([dovi.find_dovi_tool(), "inject-rpu", "-i", raw, "-r", meta, "-o", tagged])
         run([engine._tool("mkvmerge"), "-o", source, "--default-duration", "0:60000/1001fps", tagged])
+    if args.input_crf is not None:
+        prefix += f"crf{args.input_crf}-"
+        compressed_source = p / f"bench-p81-crf{args.input_crf}.mkv"
+        if not compressed_source.exists():
+            with tempfile.TemporaryDirectory(prefix="compress-", dir=p) as temp:
+                scratch = Path(temp)
+                raw, tagged = scratch / "compressed.hevc", scratch / "tagged.hevc"
+                run([*ff, "-i", low, "-c:v", "libx265", "-preset", "medium", "-crf", str(args.input_crf),
+                     "-x265-params", "pools=8:frame-threads=3:hdr10=1:repeat-headers=1:bframes=4",
+                     "-an", "-f", "hevc", raw])
+                run([dovi.find_dovi_tool(), "inject-rpu", "-i", raw, "-r", p / "bench.rpu", "-o", tagged])
+                muxed = scratch / "input.mkv"
+                run([engine._tool("mkvmerge"), "-o", muxed, "--default-duration", "0:60000/1001fps", tagged])
+                muxed.replace(compressed_source)
+        source = compressed_source
     results = {}
     for mode in args.modes:
         dest = p / (prefix + mode + ".mkv")

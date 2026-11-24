@@ -62,7 +62,7 @@ import glass
 from glass import ASSETS, GlassButton, Material, Rail, Stage, Select, ink
 from material_sample import MaterialSample
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 REPO = "https://github.com/lingjieheti/LumaFrame-Studio"
 SPONSOR = "https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md"
 TARGETS = {
@@ -72,6 +72,7 @@ TARGETS = {
     "hdr10": "生成 HDR10",
 }
 MODES = {
+    "copy": "无损封装 · 原始单层码流",
     "rtx": "NVIDIA RTX AI · 高码率 Ultra",
     "neural": "FSRCNNX · 神经网络",
     "reference": "Spline36 · 保真缩放",
@@ -354,6 +355,17 @@ class Studio(QMainWindow):
             field.addWidget(combo)
             self.setting_fields.addLayout(field, 1)
         cg.addLayout(self.setting_fields)
+        self.mapping_row = QWidget()
+        mapping_layout = layout(QHBoxLayout, self.mapping_row, 0, 12)
+        mapping_label = label("SDR 亮度映射", "field")
+        self.sdr_mapping = Select()
+        self.sdr_mapping.setAccessibleName(mapping_label.text())
+        mapping_label.setBuddy(self.sdr_mapping)
+        self.sdr_mapping.addItem("扩展高光 · 最高 1000 尼特", "expand")
+        self.sdr_mapping.addItem("保留 SDR 明暗关系 · 参考白 203 尼特", "reference")
+        mapping_layout.addWidget(mapping_label)
+        mapping_layout.addWidget(self.sdr_mapping, 1)
+        cg.addWidget(self.mapping_row)
         out = layout(QVBoxLayout, None, 0, 6)
         pb = layout(QHBoxLayout, None, 0, 8)
         self.path = QLineEdit()
@@ -655,7 +667,7 @@ class Studio(QMainWindow):
             QWidget.update(w)
 
     def set_controls(self, enabled):
-        for w in (self.renderbtn, self.previewbtn, self.browse, self.targets, self.modes):
+        for w in (self.renderbtn, self.previewbtn, self.browse, self.targets, self.modes, self.sdr_mapping):
             w.setEnabled(enabled)
 
     def choose(self):
@@ -757,6 +769,7 @@ class Studio(QMainWindow):
         self.targets.blockSignals(True)
         self.targets.clear()
         info = self.info or {}
+        self.mapping_row.setVisible(bool(info.get("supported") and info.get("source_type") == "sdr"))
         if not info.get("supported"):
             self.targets.blockSignals(False)
             self.modes.clear()
@@ -794,10 +807,15 @@ class Studio(QMainWindow):
                 keys = [key for key in keys if key != "neural"]
             if ratio <= 1.0:
                 keys = ["reference"]
+            if k == "preserve" and self.info.get("can_copy8"):
+                keys.insert(0, "copy")
         for key in keys:
             name = MODES[key]
             if k == "keep7":
                 name = "无损封装 · 原始双层码流"
+            elif (k == "preserve" and key == "reference" and self.info.get("can_keep7")
+                  and self.info.get("profile", "").endswith(" · MEL")):
+                name = "保留原始基础层 · 转换杜比元数据"
             elif key == "reference" and k in ("hdr10", "newdv"):
                 name = "Spline36 · 高位深扩展"
             self.modes.addItem(name, key)
@@ -809,6 +827,7 @@ class Studio(QMainWindow):
     def mode_change(self, *_):
         key = self.modes.currentData()
         tips = {
+            "copy": "片源已达到输出尺寸，直接保留原始 HEVC 画面、HDR 信号和杜比动态元数据。",
             "rtx": "10 位 AI 超分与高码率编码，适合优质电影片源。首次使用需下载约 416 MiB 的 NVIDIA 运行库。",
             "neural": "使用 NVIDIA GPU 增强亮度细节，以 x265 慢速 CRF 14 编码。",
             "reference": "使用高位深 Spline36 与 x265 慢速编码，适合保留胶片纹理。",
@@ -819,6 +838,9 @@ class Studio(QMainWindow):
             text = "直接保留原始画质和逐帧杜比数据。此格式需要支持 Profile 7 的播放器。"
         elif self.info and self.info.get("dv_profile") == 7 and self.targets.currentData() == "preserve":
             text += " 导出前会读取增强层，生成 HDR10 兼容的单层 Profile 8.1。"
+            if (key == "reference" and self.info.get("can_keep7")
+                    and self.info.get("profile", "").endswith(" · MEL")):
+                text = "全片确认为 MEL 时，沿用原始 HEVC 基础层，并将逐帧杜比元数据转换为 Profile 8.1。"
             if "FEL" in self.info.get("profile", ""):
                 text += " 重建的 12 位画面逐帧送入后续处理，请为分层码流和成片封装预留磁盘空间。"
         elif self.targets.currentData() == "newdv":
@@ -864,6 +886,7 @@ class Studio(QMainWindow):
         src = self.info["path"]
         mode = self.modes.currentData()
         target = self.targets.currentData()
+        mapping = self.sdr_mapping.currentData() if self.info["source_type"] == "sdr" else "expand"
         self.busy = True
         self.cancel_event = threading.Event()
         self.started_at = time.monotonic()
@@ -895,10 +918,11 @@ class Studio(QMainWindow):
                         self.cancel_event,
                         target=target,
                         duration=self.info["duration"],
+                        sdr_mapping=mapping,
                     )
                 else:
                     res = engine.render(
-                        src, dest, mode, self.events.state.emit, self.cancel_event, target=target
+                        src, dest, mode, self.events.state.emit, self.cancel_event, target=target, sdr_mapping=mapping
                     )
                 self.events.complete.emit(res, "")
             except Exception as exc:
@@ -1074,6 +1098,8 @@ def export_command(argv):
     parser.add_argument("--result", required=True, help="New JSON file for the verification result")
     parser.add_argument("--target", choices=tuple(TARGETS))
     parser.add_argument("--mode", choices=tuple(MODES))
+    parser.add_argument("--sdr-mapping", choices=("expand", "reference"), default="expand",
+                        help="SDR only: expand highlights to 1000 nits or map SDR white to 203 nits")
     parser.add_argument("--sample", action="store_true")
     options = parser.parse_args(argv)
     result_file = Path(options.result)
@@ -1093,7 +1119,10 @@ def export_command(argv):
                     )
                 if not options.mode:
                     native = (data["width"], data["height"]) == (data["target_width"], data["target_height"])
-                    options.mode = "reference" if native else "rtx"
+                    if options.target == "preserve" and data.get("can_copy8"):
+                        options.mode = "copy"
+                    else:
+                        options.mode = "reference" if native else "rtx"
             if options.sample:
                 from preview import render_sample
 
@@ -1105,6 +1134,7 @@ def export_command(argv):
                     threading.Event(),
                     target=options.target,
                     duration=data["duration"],
+                    sdr_mapping=options.sdr_mapping,
                 )
             else:
                 result = engine.render(
@@ -1114,6 +1144,7 @@ def export_command(argv):
                     lambda *_: None,
                     threading.Event(),
                     target=options.target,
+                    sdr_mapping=options.sdr_mapping,
                 )
             json.dump(result, report, ensure_ascii=False, indent=2)
             return 0

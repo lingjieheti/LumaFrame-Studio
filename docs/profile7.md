@@ -29,6 +29,45 @@ LumaFrame Studio 1.1.0 可把原生 4K Profile 7 保存为双层 MKV，也可将
 
 **HDR10 回退亮度。** 上述 150 帧实拍样片的基础层标注母版峰值 1000 尼特、MaxCLL/MaxFALL 为 1000/588。合成画面使用一致且有效的原 RPU L6，导出的 HDR10 回退层标注母版峰值 4000 尼特、MaxCLL/MaxFALL 为 9975/978。原样保存双层时保留源信令。试验还覆盖 1080p MEL 转 4K 单层，动态元数据通过复读校验。
 
+## 原生 4K MEL 转单层时保留基础层
+
+选择 Profile 8.1 和参考模式后，软件先分类整片 RPU。对于画幅已匹配的原生 4K MEL，程序直接复制原 HDR10 基础层，并按 dovi_tool 的 mode 2 转换 RPU。成片重新抽取 HEVC，对比编码画面、参数集及附带数据的指纹，再逐帧回读 RPU。FEL 含有效残差，仍需合成画面。[dovi_tool 模式](https://github.com/quietvoid/dovi_tool/tree/2.3.4)
+
+受控样片使用 FelBaker 1.0.0 的公开 150 帧实拍 BL 和 EL，调用 dovi_tool 的 mode 1 生成 MEL 测试码流。原 BL、1.2.0 成片与新版成片均独立解码为 3840 × 2160 的 10-bit YUV 4:2:0。逐帧 SHA-256 与原 BL 相同的帧数由 **0/150 提升到 150/150**。这是对保真度的逐样本检查，无法据此判断旧版误差在人眼观看时是否可见。新旧输出的 P8.1 RPU 均与独立转换的期望值一致，摘要为 `3441e196cb950a9b8f142c0e30e482bf2665d45f93ad5991dee97fb78ae0a76a`。用旧版重编码画面替换待封装的视频并保留同一份 RPU，成片校验检出了画面变化并终止导出。[上游测试素材](https://github.com/bbeny123/felbaker/tree/1.0.0/test/samples)
+
+复测时可用安装目录的工具在空目录运行下列 PowerShell 命令。将上述两份上游文件保存为 `BL-150.hevc`、`EL-150.hevc`。
+
+```powershell
+$app = Join-Path $env:LOCALAPPDATA 'Programs\LumaFrame Studio'
+$dv = Join-Path $app 'bin\dovi_tool.exe'
+$ff = Join-Path $app 'bin\ffmpeg.exe'
+& $dv mux --bl BL-150.hevc --el EL-150.hevc -o dual.hevc
+& $dv -m 1 convert -i dual.hevc -o mel.hevc
+& "$app\bin\mkvtoolnix\mkvmerge.exe" -q -o input.mkv --default-duration 0:24000/1001fps mel.hevc
+& "$app\LumaFrameStudio.exe" --export input.mkv --target preserve --mode reference --output output.mkv --result result.json | Out-Host
+& $dv -m 2 extract-rpu -i input.mkv -o expected.rpu
+& $dv extract-rpu -i output.mkv -o received.rpu
+Get-FileHash expected.rpu, received.rpu
+function PictureHashes($video) {
+    & $ff -v error -i $video -map 0:v:0 -pix_fmt yuv420p10le -fps_mode passthrough -f framehash -hash sha256 - |
+        Where-Object { $_ -match '^\s*0,' } | ForEach-Object { ($_ -split ',')[-1].Trim() }
+}
+$sourceFrames = @(PictureHashes 'BL-150.hevc')
+$resultFrames = @(PictureHashes 'output.mkv')
+if ($sourceFrames.Count -ne 150 -or ($sourceFrames -join ',') -ne ($resultFrames -join ',')) { throw 'Frame mismatch' }
+```
+
+## CM v4.0 的母版色度与 HDR10 回退
+
+L9 可逐镜头描述色原色和白点。LumaFrame 将整片一致且可表达为 HEVC 母版信令的色度写入 HDR10 回退层；使用自定义 L9 的坐标从 1/32767 换算到 1/50000。若片中出现不同母版原色，逐帧 RPU 仍保留这些变化。原有码流里的独立 HDR10 信令有自己的来源。[Dolby 元数据说明](https://professionalsupport.dolby.com/s/article/Dolby-Vision-Metadata-Levels) · [dovi_tool 色度单位和预设](https://github.com/quietvoid/dovi_tool/blob/2.3.4/dolby_vision/src/rpu/extension_metadata/primaries.rs)
+
+三段 960 × 540、各两帧的合成 P5 测试流分别使用自定义 L9、DCI-P3 影院白点和两种 L9 的逐帧切换。均从正式导出入口生成 3840 × 2160 P8.1，MaxCLL/MaxFALL 均读回为 900/300。影院白点读回为 (15700, 17550)/50000。混合片源在 1.2.0 会触发 CSV 列数错误，新版保留了变化的 RPU 并成功回读，在这段无独立母版 SEI 的样片中省略单一静态母版。可用以下命令复核字段转换，或查看实际成品的 SEI。
+
+```powershell
+python -m unittest discover -s tests -p test_dovi_mastering.py
+& "$app\bin\ffprobe.exe" -v error -select_streams v:0 -read_intervals "%+#1" -show_frames -of json output.mkv
+```
+
 ## 长片工作空间与适用范围
 
 Spline36 和 FSRCNNX 可将 12 位合成结果直接流入编码器。以 150 帧 4K FEL 实拍素材比较，流式参考档与先写无损 FFV1 再编码的实现，150 帧解码图像逐帧一致。1080p 受控输入经参考档和 FSRCNNX 放大到 4K，两档各自的两条路径也分别达到 8/8 帧一致。所有模式仍需目标磁盘空间用于原始轨道、编码和最终封装。

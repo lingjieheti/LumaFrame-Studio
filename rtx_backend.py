@@ -331,6 +331,22 @@ def decoder_input(params, hidden):
     return json.loads(probe)["streams"][0], ["-i", src]
 
 
+def pq_to_rgb10(source_range):
+    # zimg performs the matrix/range conversion before a lossless planar-to-
+    # packed rearrangement. The direct swscale packed path raises PQ black.
+    return (
+        f"zscale=filter=spline36:matrixin=2020_ncl:rangein={source_range}:matrix=gbr:range=full,"
+        "format=gbrp10le,format=x2bgr10le"
+    )
+
+
+def rgb10_to_pq():
+    return (
+        "format=gbrp10le,zscale=filter=spline36:matrixin=gbr:rangein=full:"
+        "matrix=2020_ncl:range=limited:chromal=left,format=yuv420p10le"
+    )
+
+
 def run_worker(params):
     # Windows closes this handle on process exit. Explicitly closing it would
     # kill the worker itself before it can report the final encode status.
@@ -350,23 +366,26 @@ def run_worker(params):
     ffmpeg = [bundled_tool("ffmpeg"), "-hide_banner", "-nostdin", "-loglevel", "error"]
     # RGB10A2 expects red in bits 0..9. FFmpeg calls exactly that layout x2bgr10le.
     source_range = "full" if stream.get("color_range") == "pc" else "limited"
-    init_args, source_filter = [], ""
+    init_args, rgb16_filter = [], None
     if params.get("sdr_to_hdr"):
         from hdr import sdr_filter
 
-        init_args, expansion = sdr_filter(iw, ih, iw, ih, "reference")
+        init_args, expansion = sdr_filter(
+            iw, ih, iw, ih, "reference", mapping=params.get("sdr_mapping", "expand"), output_rgb=True
+        )
         full = source_range == "full" or stream["pix_fmt"].startswith("yuvj")
         tagging = "setparams=range=" + ("full" if full else "limited")
-        source_filter = (
-            tagging + ":colorspace=bt709:color_primaries=bt709:color_trc=bt709," + expansion + ","
-        )
-        source_range = "limited"
+        rgb16_filter = tagging + ":colorspace=bt709:color_primaries=bt709:color_trc=bt709," + expansion
     elif any(side.get("dv_profile") == 5 for side in stream.get("side_data_list", [])):
         from profile5 import decode_profile5_filter
 
-        init_args, color_decode = decode_profile5_filter(iw, ih, iw, ih)
-        source_filter = color_decode + ","
-        source_range = "limited"
+        init_args, rgb16_filter = decode_profile5_filter(iw, ih, iw, ih, output_rgb=True)
+    if rgb16_filter is None:
+        source_filter = pq_to_rgb10(source_range)
+    else:
+        # SDR and P5 are reconstructed as RGB16 on Vulkan. Keep chroma at
+        # full resolution all the way to the model input.
+        source_filter = rgb16_filter + ",zscale=rangein=full:range=full:dither=ordered,format=gbrp10le,format=x2bgr10le"
     decoder = [
         *ffmpeg,
         *init_args,
@@ -378,8 +397,7 @@ def run_worker(params):
         "-sn",
         "-dn",
         "-vf",
-        source_filter
-        + f"scale=in_color_matrix=bt2020:in_range={source_range}:out_range=full:flags=bicubic+accurate_rnd+full_chroma_int,format=x2bgr10le",
+        source_filter,
         "-fps_mode",
         "passthrough",
         "-f",
@@ -399,7 +417,7 @@ def run_worker(params):
         "-i",
         "pipe:0",
         "-vf",
-        "scale=out_color_matrix=bt2020:out_chroma_loc=left:in_range=full:out_range=limited:flags=bicubic+accurate_rnd+full_chroma_int,format=yuv420p10le",
+        rgb10_to_pq(),
         "-strict",
         "-1",
         "-f",

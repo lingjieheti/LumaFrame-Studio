@@ -4,6 +4,8 @@
 
 [从官网下载](https://www.lingjie.cyou/projects/lumaframe-studio/) · [GitHub Releases](https://github.com/lingjieheti/LumaFrame-Studio/releases/latest) · [超分实测](docs/quality.md) · [双层画质验证](docs/profile7.md) · [赞助作者](https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md)
 
+**1.3.0 画质验证** 用两段 Netflix 开放 4K HDR 母版测试了无损和两档有损 1080p 片源。六组 RTX 输出的平均 HDR 色差均有下降，改善幅度随片源变化。报告列出每组结果、原码流保留条件和复算命令。[HDR 色差与母版对照](docs/quality-1.3.md)
+
 ![LumaFrame Studio 浅色工作台](docs/workspace-light.png)
 
 ## 使用
@@ -13,6 +15,8 @@
 3. 默认 **NVIDIA RTX AI · 高码率 Ultra**，使用 NVIDIA 官方十位超分模型和高码率硬件编码，优先考虑画质。第一次使用会从 NVIDIA 下载约 416 MiB 的运行库，校验后在本机缓存。也可以选择内置 **FSRCNNX**，在 NVIDIA GPU 上增强亮度细节，配合 x265 慢速 CRF 14 编码。两种模式在不同镜头上的表现与文件大小可查阅上面的画质实测。
 4. **试转片段** 会在选定目录保存影片中段关键帧附近约 5 秒的无声 4K 试片。可以分别试转两种算法，在实际观看的电视上比较颗粒、轮廓、天空和运动画面。满意后点 **导出 4K 文件**。
 5. 软件对成片重新读取，核对尺寸、色彩标记、帧数和显示时间。杜比输出还会重新抽取动态元数据，与预期的 RPU 数据逐帧对应并校验摘要。只有校验通过才写入最终文件名。
+
+原生 4K Profile 8.1 输入默认使用 **无损封装**，已有 MKV 可逐字节保留。原生 4K Profile 7 MEL 转单层时，参考模式会保留原编码基础层并转换逐帧元数据。从 SDR 制作 HDR 时，在 **SDR 亮度映射** 可选扩展高光至 1000 尼特，或保留原片的明暗关系、将 SDR 参考白映射至 203 尼特。两种设定都能先试转片段。
 
 ## 支持的输入和输出
 
@@ -65,6 +69,6 @@ Windows 安装包使用 Inno Setup 6。可先运行桌面冒烟检查，再打�
 .\LumaFrameStudio.exe --export movie.mkv --target preserve --mode neural --output movie-4K.mkv --result result.json
 ```
 
-目标值为 `keep7`（原生 4K 双层原样保留）、`preserve`（保留或转换到 Profile 8.1）、`hdr10`、`newdv`。模式值为 `neural`、`rtx`、`reference` 和适用于 Profile 8.1 的 `quality`。附加 `--sample` 可试转片段。省略目标时，符合原生双层条件的片源优先保留 Profile 7。
+目标值为 `keep7`（原生 4K 双层原样保留）、`preserve`（保留或转换到 Profile 8.1）、`hdr10`、`newdv`。模式值为 `neural`、`rtx`、`reference`、适用于 Profile 8.1 的 `quality`，以及供尺寸已经匹配的 Profile 8.1 使用的 `copy`。附加 `--sample` 可试转片段。省略目标时，符合原生双层条件的片源优先保留 Profile 7。SDR 输入可用 `--sdr-mapping reference` 选择 203 尼特参考白，或使用默认 `expand` 扩展高光。
 
 [引擎与设计取舍](docs/engineering.md) · [第三方许可与源码](THIRD_PARTY.md)

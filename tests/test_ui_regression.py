@@ -101,6 +101,20 @@ class ExportWindowTests(unittest.TestCase):
         self.assertTrue(self.window.renderbtn.isEnabled())
         self.assertIsNone(QApplication.activeModalWidget())
 
+    def test_native_p81_defaults_to_copy_and_sdr_mapping_reaches_worker(self):
+        window = self.window
+        p81 = dict(window.info, dv_profile=8, can_keep7=False, can_copy8=True, profile="Dolby Vision Profile 8.1")
+        window.got_info(0, p81, "")
+        self.assertEqual((window.targets.currentData(), window.modes.currentData()), ("preserve", "copy"))
+        self.assertTrue(window.mapping_row.isHidden())
+        window.got_info(0, dict(p81, source_type="sdr", can_copy8=False, dv_profile=None, profile="SDR BT.709"), "")
+        self.assertFalse(window.mapping_row.isHidden())
+        window.sdr_mapping.setCurrentIndex(window.sdr_mapping.findData("reference"))
+        with patch("engine.render", side_effect=ValueError("test finished")) as render:
+            window.renderbtn.click()
+            self.wait_for_result()
+        self.assertEqual(render.call_args.kwargs["sdr_mapping"], "reference")
+
 
 if __name__ == "__main__":
     unittest.main()

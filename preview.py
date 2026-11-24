@@ -6,7 +6,7 @@ import tempfile
 import engine
 
 
-def render_sample(source, destination, mode, progress, cancel, *, target, duration):
+def render_sample(source, destination, mode, progress, cancel, *, target, duration, sdr_mapping="expand"):
     dest = Path(destination)
     if dest.exists():
         raise FileExistsError("试片目标文件已存在。")
@@ -136,4 +136,4 @@ def render_sample(source, destination, mode, progress, cancel, *, target, durati
                     joined,
                 ]
             )
-        return engine.render(str(excerpt), str(dest), mode, progress, cancel, target=target)
+        return engine.render(str(excerpt), str(dest), mode, progress, cancel, target=target, sdr_mapping=sdr_mapping)

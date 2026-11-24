@@ -22,6 +22,11 @@ vec4 hook()
         dot(linear709, vec3(0.069097, 0.919540, 0.011362)),
         dot(linear709, vec3(0.016391, 0.088013, 0.895595))
     );
+#ifdef LF_REFERENCE_WHITE
+    // BT.2408 display-referred direct mapping: preserve relative display
+    // light and chromaticity, with nominal SDR white at 203 cd/m2.
+    return vec4(nits_to_pq(rgb), s.a);
+#else
     float y = dot(rgb, vec3(0.2627, 0.6780, 0.0593));
     // BT.2408 SDR reference white is 203 nits. At and below the knee
     // the black, middle grey and chromaticities from the normal conversion remain intact.
@@ -32,4 +37,5 @@ vec4 hook()
     // Limit the brightest linear RGB channel, preserving chromaticity.
     gain = min(gain, peak / max(max(rgb.r, rgb.g), max(rgb.b, 0.00001)));
     return vec4(nits_to_pq(rgb * gain), s.a);
+#endif
 }
