@@ -1,6 +1,6 @@
 """Regression tests for the bounded, lossless RTX worker transport."""
 from concurrent.futures import Future
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 from unittest import mock
 import ctypes as ct
 import io
@@ -101,6 +101,9 @@ class FastTransport(unittest.TestCase):
                 config = dict(source="source",output=str(Path(folder,"out.hevc")),width=width*2,height=height,
                               rpu=None,quality=18,max_bitrate=60000,mastering=None,max_cll=None,speed="fast")
                 with self.subTest(scenario=scenario), ExitStack() as patches:
+                    # The desktop worker sends UTF-8 text to its parent. Capture
+                    # it independently of the test runner's Windows code page.
+                    progress = patches.enter_context(redirect_stdout(io.StringIO()))
                     def patch(target, **kwargs):
                         return patches.enter_context(mock.patch.object(rtx,target,**kwargs))
                     patch("ChildJob")
@@ -114,6 +117,7 @@ class FastTransport(unittest.TestCase):
                     start = time.monotonic()
                     if scenario == "ok":
                         self.assertEqual(rtx.run_worker(config),0)
+                        self.assertIn(f"progress_frame={count}", progress.getvalue().splitlines())
                     elif scenario == "early_exit":
                         with self.assertRaises((OSError,RuntimeError)):
                             rtx.run_worker(config)
