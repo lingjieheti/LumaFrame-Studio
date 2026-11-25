@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QVBoxLayout,
     QHBoxLayout,
-    QBoxLayout,
+    QGridLayout,
     QComboBox,
     QCheckBox,
     QLineEdit,
@@ -63,7 +63,7 @@ import glass
 from glass import ASSETS, GlassButton, Material, Rail, Stage, Select, ink
 from material_sample import MaterialSample
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 REPO = "https://github.com/lingjieheti/LumaFrame-Studio"
 SPONSOR = "https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md"
 TARGETS = {
@@ -82,6 +82,10 @@ MODES = {
 }
 ROOT = Path(__file__).resolve().parent
 HIDE = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def supports_fast_export(mode, target):
+    return mode in {"rtx", "rtx_compressed"} and target in {"preserve", "hdr10", "newdv"}
 
 
 def centered_margins(width, height, ratio):
@@ -364,11 +368,22 @@ class Studio(QMainWindow):
         self.events.gpu.connect(self.gpu_label.setText)
         self.targets = Select()
         self.modes = Select()
+        self.speeds = Select()
+        self.speeds.addItem("标准", "quality")
+        self.speeds.addItem("并行加速", "fast")
+        if self.settings.value("rtxSpeed") == "fast":
+            self.speeds.setCurrentIndex(1)
+        self.speeds.setToolTip("标准模式使用常规缓冲。并行加速增加缓冲，让 RTX 超分与编码并行。试转和整片使用相同设置。")
         self.targets.setPlaceholderText("根据片源匹配")
         self.modes.setPlaceholderText("根据分辨率推荐")
-        self.setting_fields = layout(QHBoxLayout, None, 0, 14)
-        for title, combo in [("输出格式", self.targets), ("画质模式", self.modes)]:
-            field = layout(QVBoxLayout, None, 0, 6)
+        self.setting_fields = layout(QGridLayout, None, 0, 14)
+        self.field_groups = []
+        self.field_columns = None
+        for title, combo in [
+            ("输出格式", self.targets), ("画质模式", self.modes), ("速度模式", self.speeds)
+        ]:
+            group = QWidget()
+            field = layout(QVBoxLayout, group, 0, 6)
             cap = label(title, "field")
             cap.setBuddy(combo)
             combo.setAccessibleName(title)
@@ -376,7 +391,11 @@ class Studio(QMainWindow):
             combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             field.addWidget(cap)
             field.addWidget(combo)
-            self.setting_fields.addLayout(field, 1)
+            self.field_groups.append(group)
+            if combo is self.speeds:
+                self.speed_field = group
+                group.hide()
+        self.arrange_fields()
         cg.addLayout(self.setting_fields)
         self.mapping_row = QWidget()
         mapping_layout = layout(QHBoxLayout, self.mapping_row, 0, 12)
@@ -446,6 +465,7 @@ class Studio(QMainWindow):
         cg.addWidget(self.hint)
         self.targets.currentIndexChanged.connect(self.target_change)
         self.modes.currentIndexChanged.connect(self.mode_change)
+        self.speeds.currentIndexChanged.connect(self.speed_change)
         box.addStretch()
         self.status = label("", "status")
         self.status.hide()
@@ -623,9 +643,23 @@ class Studio(QMainWindow):
         self.brandtext.setVisible(not compact)
         for button, caption in self.rail_labels:
             button.setText("" if compact else caption)
-        self.setting_fields.setDirection(
-            QBoxLayout.TopToBottom if self.width() < 775 else QBoxLayout.LeftToRight
-        )
+        self.arrange_fields()
+
+    def arrange_fields(self):
+        columns = 1 if self.width() < 775 else 2
+        if self.width() >= 1080 and not self.speed_field.isHidden():
+            columns = 3
+        if columns == self.field_columns:
+            return
+        self.field_columns = columns
+        for group in self.field_groups:
+            self.setting_fields.removeWidget(group)
+        for col, stretch in enumerate((5, 5 if columns > 1 else 0, 2 if columns == 3 else 0)):
+            self.setting_fields.setColumnStretch(col, stretch)
+        for i, group in enumerate(self.field_groups):
+            row, col = divmod(i, columns)
+            span = 2 if columns == 2 and group is self.speed_field else 1
+            self.setting_fields.addWidget(group, row, col, 1, span)
 
     def eventFilter(self, obj, event):
         if obj is getattr(self, "stage", None) and event.type() == QEvent.Resize:
@@ -726,7 +760,7 @@ class Studio(QMainWindow):
             QWidget.update(w)
 
     def set_controls(self, enabled):
-        for w in (self.renderbtn, self.previewbtn, self.browse, self.targets, self.modes, self.sdr_mapping,
+        for w in (self.renderbtn, self.previewbtn, self.browse, self.targets, self.modes, self.speeds, self.sdr_mapping,
                   self.area_panel):
             w.setEnabled(enabled)
 
@@ -836,6 +870,8 @@ class Studio(QMainWindow):
         self.mapping_row.setVisible(bool(info.get("supported") and info.get("source_type") == "sdr"))
         if not info.get("supported"):
             self.area_panel.hide()
+            self.speed_field.hide()
+            self.arrange_fields()
             self.targets.blockSignals(False)
             self.modes.clear()
             self.hint.hide()
@@ -898,6 +934,9 @@ class Studio(QMainWindow):
 
     def mode_change(self, *_):
         key = self.modes.currentData()
+        rtx_speed = supports_fast_export(key, self.targets.currentData())
+        self.speed_field.setVisible(rtx_speed)
+        self.arrange_fields()
         tips = {
             "copy": "片源已达到输出尺寸，直接保留原始 HEVC 画面、HDR 信号和杜比动态元数据。",
             "rtx": "10 位 AI 超分与高码率编码，适合优质电影片源。首次使用需下载约 416 MiB 的 NVIDIA 运行库。",
@@ -920,8 +959,16 @@ class Studio(QMainWindow):
             text = "沿用原始 HDR10 画面和母版亮度，逐镜测量生成杜比动态元数据。"
         elif self.targets.currentData() == "newdv":
             text += " 按新画面测量生成杜比动态元数据。"
+        if rtx_speed:
+            if self.speeds.currentData() == "fast":
+                text += " 并行加速增加缓冲，让超分与编码并行。"
+            text += " 两档使用相同的超分模型和编码参数。"
         self.hint.setText(text)
         self.hint.setVisible(bool(self.info and self.info.get("supported") and text))
+
+    def speed_change(self):
+        self.settings.setValue("rtxSpeed", self.speeds.currentData())
+        self.mode_change()
 
     def suggest_dest(self):
         if not self.info or not self.info["supported"]:
@@ -961,6 +1008,7 @@ class Studio(QMainWindow):
         src = self.info["path"]
         mode = self.modes.currentData()
         target = self.targets.currentData()
+        speed = self.speeds.currentData() if supports_fast_export(mode, target) else "quality"
         mapping = self.sdr_mapping.currentData() if self.info["source_type"] == "sdr" else "expand"
         active_area = None
         choice = self.area_choice.currentData()
@@ -1008,11 +1056,12 @@ class Studio(QMainWindow):
                         duration=self.info["duration"],
                         sdr_mapping=mapping,
                         active_area=active_area,
+                        speed=speed,
                     )
                 else:
                     res = engine.render(
                         src, dest, mode, self.events.state.emit, self.cancel_event, target=target,
-                        sdr_mapping=mapping, active_area=active_area,
+                        sdr_mapping=mapping, active_area=active_area, speed=speed,
                     )
                 self.events.complete.emit(res, "")
             except Exception as exc:
@@ -1188,6 +1237,8 @@ def export_command(argv):
     parser.add_argument("--result", required=True, help="New JSON file for the verification result")
     parser.add_argument("--target", choices=tuple(TARGETS))
     parser.add_argument("--mode", choices=tuple(MODES))
+    parser.add_argument("--speed", choices=("quality", "fast"), default="quality",
+                        help="RTX pipeline: quality (standard buffers, default) or fast (parallel). Same model and encoding settings.")
     parser.add_argument("--sdr-mapping", choices=("expand", "reference"), default="expand",
                         help="SDR only: expand highlights to 1000 nits or map SDR white to 203 nits")
     parser.add_argument("--sample", action="store_true")
@@ -1213,6 +1264,8 @@ def export_command(argv):
                         options.mode = "copy"
                     else:
                         options.mode = "reference" if native else "rtx"
+            if options.speed == "fast" and not supports_fast_export(options.mode, options.target):
+                raise ValueError("--speed fast 仅适用于实际放大的 RTX 模式（rtx、rtx_compressed）。")
             if options.sample:
                 from preview import render_sample
 
@@ -1226,6 +1279,7 @@ def export_command(argv):
                     duration=data["duration"],
                     sdr_mapping=options.sdr_mapping,
                     active_area=options.active_area,
+                    speed=options.speed,
                 )
             else:
                 result = engine.render(
@@ -1237,6 +1291,7 @@ def export_command(argv):
                     target=options.target,
                     sdr_mapping=options.sdr_mapping,
                     active_area=options.active_area,
+                    speed=options.speed,
                 )
             json.dump(result, report, ensure_ascii=False, indent=2)
             return 0

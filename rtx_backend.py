@@ -17,6 +17,7 @@ import tempfile
 import time
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 from ai import app_dir, nvenc_command
 
@@ -248,6 +249,20 @@ class GPUFrame:
     def close(self):
         self.cuda.cudaFree(self.ptr)
 
+    def host_buffer(self, size, stack):
+        """Pinned memory avoids the CUDA driver's extra pageable-memory copy."""
+        pointer = ct.c_void_p()
+        status = self.cuda.cudaHostAlloc(ct.byref(pointer), ct.c_size_t(size), 0)
+        if status:
+            # Lockable memory is a machine-wide resource. Fall back to the same
+            # pageable storage used by the quality path when it is unavailable.
+            if status not in (2, 801):  # cudaErrorMemoryAllocation / cudaErrorNotSupported
+                self.check(status)
+            self.cuda.cudaGetLastError()
+            return bytearray(size)
+        stack.callback(self.cuda.cudaFreeHost, pointer)
+        return memoryview((ct.c_ubyte * size).from_address(pointer.value)).cast("B")
+
 
 class ChildJob:
     """Contain the worker, codec tools and any NGX runtime helper processes."""
@@ -305,6 +320,56 @@ def read_frame(stream, frame):
     return True
 
 
+def _large_pipe():
+    import _winapi
+    import msvcrt
+
+    try:
+        read_handle, write_handle = _winapi.CreatePipe(None, 4 << 20)
+    except OSError:
+        # Windows may deny the larger nonpaged-pool allocation.
+        return os.pipe()
+    try:
+        read_fd = msvcrt.open_osfhandle(read_handle, os.O_BINARY | os.O_RDONLY)
+    except BaseException:
+        _winapi.CloseHandle(read_handle)
+        _winapi.CloseHandle(write_handle)
+        raise
+    try:
+        write_fd = msvcrt.open_osfhandle(write_handle, os.O_BINARY | os.O_WRONLY)
+    except BaseException:
+        os.close(read_fd)
+        _winapi.CloseHandle(write_handle)
+        raise
+    return read_fd, write_fd
+
+
+def _frame_pipe(stack):
+    r, w = _large_pipe()
+    reader = stack.enter_context(os.fdopen(r, "rb", 0))
+    writer = stack.enter_context(os.fdopen(w, "wb", 0))
+    return reader, writer
+
+
+def _write_frame(stream, frame):
+    view = memoryview(frame)
+    while view:
+        n = stream.write(view)
+        if not n:
+            raise BrokenPipeError("编码管道在一帧写入完成前已关闭。")
+        view = view[n:]
+
+
+def _wait_write(future):
+    while True:
+        try:
+            return future.result(timeout=0.15)
+        except TimeoutError:
+            if future.done():
+                return future.result()
+            check_cancel()
+
+
 def decoder_input(params, hidden):
     src = params["source"]
     raw = params.get("fel_input")
@@ -356,6 +421,10 @@ def run_worker(params):
     hidden = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     env = os.environ.copy()
     w, h = params["width"], params["height"]
+    speed = params.get("speed", "quality")
+    if speed not in ("quality", "fast"):
+        raise ValueError("未知的 RTX 处理速度。")
+    fast = speed == "fast"
     stream, input_args = decoder_input(params, hidden)
     rate = stream.get("avg_frame_rate")
     if not rate or rate == "0/0":
@@ -451,7 +520,7 @@ def run_worker(params):
     strength = 0.6 if compressed else 1.0
     print(
         f"NVIDIA RTX Video Super Resolution | VFX {nvvfx.get_sdk_version()} | {quality.name} {strength:.2f} "
-        f"| RGB10A2 {iw}x{ih} -> {w}x{h}",
+        f"| RGB10A2 {iw}x{ih} -> {w}x{h}" + (" | 异步帧传输" if fast else ""),
         flush=True,
     )
     created = []
@@ -469,30 +538,61 @@ def run_worker(params):
         effect.output_width, effect.output_height = w, h
         effect.load()
         try:
-            dec = subprocess.Popen(decoder, stdout=subprocess.PIPE, creationflags=hidden, env=env)
+            if fast:
+                decoded, decoder_out = _frame_pipe(stack)
+                converter_in, sink = _frame_pipe(stack)
+                encoder_in, converter_out = _frame_pipe(stack)
+            else:
+                decoder_out = converter_in = converter_out = subprocess.PIPE
+            dec = subprocess.Popen(decoder, stdout=decoder_out, creationflags=hidden, env=env)
             created.append(dec)
+            if fast:
+                decoder_out.close()
             conv = subprocess.Popen(
-                converter, stdin=subprocess.PIPE, stdout=subprocess.PIPE, creationflags=hidden, env=env
+                converter, stdin=converter_in, stdout=converter_out, creationflags=hidden, env=env
             )
             created.append(conv)
-            enc = subprocess.Popen(encoder, stdin=conv.stdout, creationflags=hidden, env=env)
+            if fast:
+                converter_in.close()
+                converter_out.close()
+            else:
+                decoded, sink, encoder_in = dec.stdout, conv.stdin, conv.stdout
+            enc = subprocess.Popen(encoder, stdin=encoder_in, creationflags=hidden, env=env)
             created.append(enc)
-            conv.stdout.close()
-            buf_in, buf_out = bytearray(iw * ih * 4), bytearray(w * h * 4)
+            encoder_in.close()
+            if fast:
+                buf_in = gpu.host_buffer(iw * ih * 4, stack)
+                buffers = [gpu.host_buffer(w * h * 4, stack) for _ in range(2)]
+                writer = stack.enter_context(ThreadPoolExecutor(max_workers=1))
+            else:
+                buf_in = bytearray(iw * ih * 4)
+                buffers = [bytearray(w * h * 4)]
+            pending_write = None
             count = 0
             last_progress = time.monotonic()
-            while read_frame(dec.stdout, buf_in):
+            while read_frame(decoded, buf_in):
                 check_cancel()
                 gpu.upload(buf_in)
+                buf_out = buffers[count % len(buffers)]
                 gpu.download(effect.run(gpu).image, buf_out, w, h)
-                conv.stdin.write(buf_out)
+                if fast:
+                    # The writer owns the preceding buffer while VFX fills the
+                    # current one. A single worker preserves frame order and
+                    # keeping at most one write pending bounds memory use.
+                    if pending_write is not None:
+                        _wait_write(pending_write)
+                    pending_write = writer.submit(_write_frame, sink, buf_out)
+                else:
+                    _write_frame(sink, buf_out)
                 count += 1
                 now = time.monotonic()
                 if now - last_progress >= 0.8:
                     print(f"progress_frame={count}", flush=True)
                     last_progress = now
             print(f"progress_frame={count}", flush=True)
-            conv.stdin.close()
+            if pending_write is not None:
+                _wait_write(pending_write)
+            sink.close()
             if any(status != 0 for status in [dec.wait(), conv.wait(), enc.wait()]) or not count:
                 raise RuntimeError("RTX 解码、色彩转换或 HEVC 编码未成功，请查看上方日志。")
         finally:

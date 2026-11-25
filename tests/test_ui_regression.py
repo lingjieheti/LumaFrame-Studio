@@ -1,5 +1,6 @@
 """Exercise export naming and worker-state transitions through real Qt controls."""
 
+import json
 import os
 import sys
 import tempfile
@@ -95,6 +96,85 @@ class ExportWindowTests(unittest.TestCase):
         self.assertGreater(self.window.modes.findData("rtx_compressed"), 0)
         self.window.got_info(0, dict(info, width=3840, height=2160, can_copy8=True), "")
         self.assertEqual(self.window.modes.findData("rtx_compressed"), -1)
+
+    def test_rtx_speed_reaches_sample_and_render_only_on_applicable_modes(self):
+        window = self.window
+        source = dict(window.info, dv_profile=8, width=1920, height=1080, can_keep7=False)
+        window.got_info(0, source, "")
+        self.assertFalse(window.speed_field.isHidden())
+        self.assertEqual(window.speeds.currentData(), "quality")
+        self.assertEqual(window.speeds.currentText(), "标准")
+        self.assertIn("相同的超分模型和编码参数", window.hint.text())
+        with patch("engine.render", side_effect=ValueError("test finished")) as render:
+            window.start()
+            self.assertFalse(window.speeds.isEnabled())
+            self.wait_for_result()
+        self.assertEqual(render.call_args.kwargs["speed"], "quality")
+
+        window.speeds.setCurrentIndex(window.speeds.findData("fast"))
+        self.assertEqual(window.speeds.currentText(), "并行加速")
+        self.assertEqual(window.settings.value("rtxSpeed"), "fast")
+        for mode, sample in (("rtx", True), ("rtx_compressed", False), ("reference", True)):
+            with self.subTest(mode=mode):
+                window.modes.setCurrentIndex(window.modes.findData(mode))
+                self.assertEqual(window.speed_field.isHidden(), mode == "reference")
+                with patch("preview.render_sample" if sample else "engine.render",
+                           side_effect=ValueError("test finished")) as worker:
+                    window.start(sample=sample)
+                    self.wait_for_result()
+                self.assertEqual(worker.call_args.kwargs["speed"], "quality" if mode == "reference" else "fast")
+
+        native = dict(source, width=3840, height=2160, can_copy8=True)
+        window.got_info(0, native, "")
+        self.assertEqual(window.modes.currentData(), "copy")
+        self.assertTrue(window.speed_field.isHidden())
+        with patch.object(main, "QSettings", return_value=window.settings):
+            reopened = main.Studio()
+        self.addCleanup(reopened.close)
+        self.assertTrue(reopened.speed_field.isHidden())
+        reopened.got_info(0, source, "")
+        self.assertEqual(reopened.speeds.currentData(), "fast")
+
+    def test_export_command_validates_speed_after_resolving_mode_and_target(self):
+        # Explicit CLI options and the default-mode path must agree with the desktop controls.
+        source = dict(self.window.info, dv_profile=8, width=1920, height=1080, can_keep7=False)
+        args = [source["path"], "--output", str(self.directory / "out.mkv")]
+        cases = (
+            ([], "quality", "rtx", False),
+            (["--speed", "fast", "--sample"], "fast", "rtx", True),
+            (["--target", "preserve", "--mode", "rtx_compressed", "--speed", "fast"], "fast", "rtx_compressed", False),
+            (["--target", "preserve", "--mode", "reference", "--speed", "fast"], None, None, False),
+            (["--target", "keep7", "--mode", "rtx", "--speed", "fast"], None, None, False),
+        )
+        for i, (extra, expected, mode, sample) in enumerate(cases):
+            report = self.directory / f"report-{i}.json"
+            with self.subTest(extra=extra), patch("engine.inspect_source", return_value=source), \
+                    patch("preview.render_sample" if sample else "engine.render", return_value={"verified": True}) as worker:
+                result = main.export_command(args + ["--result", str(report)] + extra)
+                saved = json.loads(report.read_text("utf-8"))
+                if expected:
+                    self.assertEqual(result, 0)
+                    self.assertTrue(saved["verified"])
+                    self.assertEqual(worker.call_args.args[2], mode)
+                    self.assertEqual(worker.call_args.kwargs["speed"], expected)
+                else:
+                    self.assertEqual(result, 1)
+                    self.assertFalse(saved["verified"])
+                    self.assertIn("--speed fast", saved["error"])
+                    worker.assert_not_called()
+
+    def test_three_speed_controls_reflow_as_the_window_narrows(self):
+        window = self.window
+        window.got_info(0, dict(window.info, dv_profile=8, width=1920, height=1080, can_keep7=False), "")
+        window.show()
+        grid = window.setting_fields
+        for width, expected in [(1100, (0, 2, 1, 1)), (920, (1, 0, 1, 2)), (720, (2, 0, 1, 1))]:
+            with self.subTest(width=width):
+                window.resize(width, 480)
+                self.app.processEvents()
+                self.assertEqual(grid.getItemPosition(grid.indexOf(window.speed_field)), expected)
+                self.assertTrue(window.speed_field.isVisible())
+                self.assertTrue(window.renderbtn.isVisible())
 
     def test_existing_names_and_preview_keep_custom_destination(self):
         chosen = self.directory / "自选名称.mkv"

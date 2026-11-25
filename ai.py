@@ -41,9 +41,12 @@ def nvenc_command(
     fel_input=None,
     sdr_mapping="expand",
     compressed_source=False,
+    speed="quality",
 ):
     """Return argv. `source` is a verified limited-range BT.2020/PQ main layer."""
     width, height = int(width), int(height)
+    if speed not in ("quality", "fast"):
+        raise ValueError("未知的 RTX 处理速度。")
     if min(width, height) <= 0 or width % 2 or height % 2:
         raise ValueError("4:2:0 输出宽高必须为正偶数。")
     if not 0 <= int(quality) <= 51 or not 1000 <= int(max_bitrate) <= 240000:
@@ -69,6 +72,8 @@ def nvenc_command(
         )
         if compressed_source:
             payload["compressed_source"] = True
+        if speed == "fast":
+            payload["speed"] = speed
         if fel_input is not None:
             iw, ih, fps = fel_input
             if source != "pipe:0" or sdr_to_hdr or min(iw, ih) < 2 or iw % 2 or ih % 2:

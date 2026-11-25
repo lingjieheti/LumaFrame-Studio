@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections import Counter, deque
 from fractions import Fraction
 from pathlib import Path
@@ -581,6 +582,7 @@ def _gpu_command(source, output, info, mode, target, rpu, master, cll, *, fel_in
         sdr_mapping=info.get("sdr_mapping", "expand"),
         fel_input=fel_input,
         compressed_source=info.get("compressed_source", False),
+        speed=info.get("speed", "quality"),
     )
 
 
@@ -914,7 +916,7 @@ def _verify_other(source, output, original, result, chapter_streams, explicit_ch
 
 
 def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_mapping="expand",
-           active_area=None):
+           active_area=None, speed="quality"):
     source = Path(path).resolve(strict=True)
     before = source.stat()
     dest = Path(destination).resolve()
@@ -922,6 +924,10 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
         raise FileExistsError("目标文件已存在，请选择新的输出文件名。")
     if dest.suffix.lower() != ".mkv" or not dest.parent.is_dir():
         raise ValueError("请选择现有文件夹中的 .mkv 输出文件。")
+    if speed not in {"quality", "fast"}:
+        raise ValueError("未知的 RTX 速度模式。")
+    if speed == "fast" and (mode not in {"rtx", "rtx_compressed"} or target == "keep7"):
+        raise ValueError("并行加速仅用于 RTX 超分导出。")
     if mode not in {"quality", "reference", "neural", "rtx", "rtx_compressed", "copy"} or target not in {
         "preserve",
         "keep7",
@@ -951,6 +957,7 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
     if sdr_mapping not in {"expand", "reference"} or (sdr_mapping != "expand" and info["source_type"] != "sdr"):
         raise ValueError("亮度映射仅适用于 SDR 片源，请选择有效的映射方式。")
     info["sdr_mapping"] = sdr_mapping
+    info["speed"] = speed
     native = target == "keep7"
     author_native = is_hdr10 and same_size
     if author_native and (mode != "copy" or target != "newdv"):
@@ -1211,16 +1218,25 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
             from ai import rtx_status
 
             cmd = _gpu_command(picture, encoded, info, mode, target, rpu, master, cll)
+            first_frame_time = None
+            first_frame_count = 0
 
             def nv_progress(line):
+                nonlocal first_frame_time, first_frame_count
                 status = rtx_status(line)
                 if status:
                     progress(12, status)
                 if line.startswith("progress_frame=") and line[15:].isdigit():
                     current = int(line[15:])
+                    now = time.monotonic()
+                    rate_text = ""
+                    if first_frame_time is None:
+                        first_frame_time, first_frame_count = now, current
+                    elif now > first_frame_time and current > first_frame_count:
+                        rate_text = f" · {(current - first_frame_count) / (now - first_frame_time):.1f} fps"
                     progress(
                         12 + min(1, current / len(times)) * 60,
-                        f"RTX 超分  ·  {current:,} / {len(times):,} 帧",
+                        f"RTX 超分  ·  {current:,} / {len(times):,} 帧{rate_text}",
                     )
                     return
                 if mode == "rtx":
@@ -1408,6 +1424,8 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
             audio_count=info["audio_count"],
             subtitle_count=info["subtitle_count"],
         )
+        if mode == "rtx":
+            result["speed"] = speed
         if info["dv_profile"] == 7:
             result.update(
                 input_dv_profile=7,

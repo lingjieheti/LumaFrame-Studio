@@ -7,7 +7,7 @@ import engine
 
 
 def render_sample(source, destination, mode, progress, cancel, *, target, duration, sdr_mapping="expand",
-                  active_area=None):
+                  active_area=None, speed="quality"):
     dest = Path(destination)
     if dest.exists():
         raise FileExistsError("试片目标文件已存在。")
@@ -138,4 +138,4 @@ def render_sample(source, destination, mode, progress, cancel, *, target, durati
                 ]
             )
         return engine.render(str(excerpt), str(dest), mode, progress, cancel, target=target,
-                             sdr_mapping=sdr_mapping, active_area=active_area)
+                             sdr_mapping=sdr_mapping, active_area=active_area, speed=speed)

@@ -4,7 +4,9 @@
 
 [从官网下载](https://www.lingjie.cyou/projects/lumaframe-studio/) · [GitHub Releases](https://github.com/lingjieheti/LumaFrame-Studio/releases/latest) · [超分实测](docs/quality.md) · [双层画质验证](docs/profile7.md) · [赞助作者](https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md)
 
-**1.4.1 画质验证** 低于目标尺寸的静态 HDR10 可直接超分至 4K HDR10 或杜比视界。新编码的 HDR10 和杜比文件按最终画面实测 MaxCLL/MaxFALL，支持指定电影黑边。新制杜比改进了低对比剪辑识别。[片源和实测](docs/quality-1.4.1.md) · [跨方案与运动压力测试](docs/coverage-1.4.1.md) · [压缩片源修复](docs/compressed-1.4.md)
+**1.4.2 RTX 速度模式** 在导出设置里选择「速度模式」。并行加速使用额外的内存缓冲，让显卡处理下一帧时，上一帧可以同时送往色彩转换和编码。两档使用相同的 RTX 超分模型、强度、10 位色彩转换和 HEVC 编码参数。试转与整片导出共用所选设置。命令行可在 RTX 导出命令中加入 `--speed fast`。[速度与画质实测](docs/speed-1.4.2.md)
+
+低于目标尺寸的静态 HDR10 可直接超分至 4K HDR10 或杜比视界。新编码的 HDR10 和杜比文件按最终画面实测 MaxCLL/MaxFALL，支持指定电影黑边。[片源和实测](docs/quality-1.4.1.md) · [跨方案与运动压力测试](docs/coverage-1.4.1.md) · [压缩片源修复](docs/compressed-1.4.md) · [新制杜比的剪辑识别](docs/scene-analysis-1.4.1.md)
 
 ![LumaFrame Studio 浅色工作台](docs/workspace-light.png)
 

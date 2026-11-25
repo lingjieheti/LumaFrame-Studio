@@ -4,7 +4,7 @@
 [Setup]
 AppId={{E839665F-01D2-43AC-BA81-5C5B30A03C17}
 AppName=LumaFrame Studio
-AppVersion=1.4.1
+AppVersion=1.4.2
 AppPublisher=lingjieheti
 AppPublisherURL=https://github.com/lingjieheti/LumaFrame-Studio
 AppSupportURL=https://github.com/lingjieheti/LumaFrame-Studio/issues
@@ -15,7 +15,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\LumaFrameStudio.exe
 SetupIconFile={#StageDir}\assets\icon.ico
-OutputBaseFilename=LumaFrame-Studio-1.4.1-Windows-x64
+OutputBaseFilename=LumaFrame-Studio-1.4.2-Windows-x64
 Compression=lzma2/fast
 SolidCompression=yes
 WizardStyle=modern
