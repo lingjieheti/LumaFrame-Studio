@@ -172,6 +172,7 @@ def bake(
     progress,
     *,
     encoder_command=None,
+    on_frame=None,
 ):
     """Pipe composed PQ12 pixels directly to a chosen HEVC encoder, or retain a lossless intermediate."""
     from engine import _check_cancel, _tool
@@ -298,6 +299,9 @@ def bake(
                 for line in status.readlines():
                     if line.startswith(b"frame=") and line[6:].strip().isdigit():
                         completed = int(line[6:])
+                        if on_frame is not None:
+                            on_frame(completed)
+                            continue
                         stage = "合成杜比增强层并编码" if direct else "合成杜比增强层"
                         progress(
                             first + span * min(1, completed / expected_frames),

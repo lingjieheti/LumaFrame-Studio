@@ -20,6 +20,7 @@ def run(source=None, pictures=None):
     app.setFont(QFont("Microsoft YaHei UI", 10))
     with tempfile.TemporaryDirectory() as temp:
         settings = QSettings(str(Path(temp) / "preferences.ini"), QSettings.IniFormat)
+        settings.setValue("uiLanguage", "zh-CN")
         with patch.object(main, "QSettings", return_value=settings):
             window = main.Studio()
         window.setAttribute(Qt.WA_DontShowOnScreen)

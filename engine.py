@@ -37,6 +37,42 @@ def _check_cancel(cancel):
         raise InterruptedError("任务已取消。")
 
 
+class _Stage:
+    """Map actual tool counters to a small part of export progress."""
+
+    def __init__(self, progress, key, label, unit, start, end):
+        self.progress, self.key, self.label, self.unit = progress, key, label, unit
+        self.start, self.end = start, end
+        self.last, self.last_at = -1, 0
+        self.first, self.first_at = None, None
+
+    def __call__(self, current, total):
+        if total <= 0:
+            return
+        current = max(0, min(current, total))
+        if current <= self.last:
+            return
+        now = time.monotonic()
+        if self.last >= 0 and current < total and now - self.last_at < 0.4:
+            return
+        if self.first is None:
+            self.first, self.first_at = current, now
+        self.last, self.last_at = current, now
+        label = self.label
+        stage = getattr(self.progress, "stage", None)
+        if stage is not None:
+            stage(self.key, current, total, self.unit)
+        elif self.unit == "frames":
+            label += f" · {current:,} / {total:,} 帧"
+            if current > self.first and now > self.first_at:
+                label += f" · {(current - self.first) / (now - self.first_at):.1f} fps"
+        elif self.unit == "bytes":
+            label += f" · {current / 1048576:,.1f} / {total / 1048576:,.1f} MiB"
+        else:
+            label += f" · {100 * current / total:.1f}%"
+        self.progress(self.start + (self.end - self.start) * current / total, label)
+
+
 class _Runner:
     """Read pipes concurrently and stop active tools even when they produce no progress."""
 
@@ -44,7 +80,7 @@ class _Runner:
         self.cancel = cancel
         self.worker_cancel = None
 
-    def __call__(self, args, line_callback=None, *, collect=True):
+    def __call__(self, args, line_callback=None, *, collect=True, on_poll=None):
         _check_cancel(self.cancel)
         args = [str(item) for item in args]
         if (
@@ -78,9 +114,15 @@ class _Runner:
         reader = threading.Thread(target=read_output, daemon=True)
         reader.start()
         lines = [] if collect else deque(maxlen=32)
+        mkv_warnings = deque(maxlen=8)
+        is_mux = Path(args[0]).stem.lower() == "mkvmerge"
+        next_poll = 0
         try:
             while True:
                 _check_cancel(self.cancel)
+                if on_poll is not None and time.monotonic() >= next_poll:
+                    on_poll()
+                    next_poll = time.monotonic() + 0.5
                 try:
                     line = messages.get(timeout=0.2)
                 except queue.Empty:
@@ -88,14 +130,16 @@ class _Runner:
                 if line is None:
                     break
                 lines.append(line)
+                if is_mux and ("Warning:" in line or line.startswith("#GUI#warning")):
+                    mkv_warnings.append(line)
                 if line_callback:
                     line_callback(line.strip())
             code = process.wait()
             result = "".join(lines)
             if code != 0:
-                if Path(args[0]).stem.lower() == "mkvmerge" and code == 1:
+                if is_mux and code == 1:
                     # A warning may indicate discarded packets or an unsupported track.
-                    detail = "\n".join(l for l in lines if "Warning:" in l) or result[-1800:]
+                    detail = "".join(mkv_warnings) or result[-1800:]
                     raise RuntimeError("MKV 封装发出警告，未发布文件。\n" + detail[-1800:])
                 raise RuntimeError(f"{Path(args[0]).name} 返回 {code}。\n{result[-2200:]}")
             return result
@@ -390,14 +434,13 @@ def inspect_source(path, *, cancel=None):
     return _inspect(path, _probe(path, run), run)
 
 
-def _times(path, index, run, *, coded_order=False, with_end=False):
+def _times(path, index, run, *, coded_order=False, with_end=False, on_position=None, on_frame=None, pgs=None):
     # Packet PTS is in presentation order after sorting, even with B-frame reordering.
     times = []
     last_pts = end = None
 
-    def packet(line):
+    def video_packet(fields):
         nonlocal last_pts, end
-        fields = line.split(",", 2)
         token = fields[0].strip()
         if not token:
             return
@@ -405,6 +448,12 @@ def _times(path, index, run, *, coded_order=False, with_end=False):
             raise ValueError("视频缺少可还原的显示时间戳。")
         pts = round(float(token) * 1_000_000)
         times.append(pts)
+        if on_frame is not None:
+            on_frame(len(times))
+        if on_position is not None:
+            pos_index = 2 if with_end else 1
+            if len(fields) > pos_index and fields[pos_index].isdigit():
+                on_position(int(fields[pos_index]))
         if with_end and (last_pts is None or pts > last_pts):
             last_pts, end = pts, None
             if len(fields) > 1 and re.fullmatch(r"\d+(\.\d+)?", fields[1]):
@@ -412,23 +461,42 @@ def _times(path, index, run, *, coded_order=False, with_end=False):
                 if duration > 0:
                     end = pts + duration
 
-    run(
-        [
-            _tool("ffprobe"),
-            "-v",
-            "error",
-            "-select_streams",
-            str(index),
-            "-show_packets",
-            "-show_entries",
-            "packet=pts_time,duration_time:packet_side_data=" if with_end else "packet=pts_time:packet_side_data=",
-            "-of",
-            "csv=p=0",
-            path,
-        ],
-        packet,
-        collect=False,
-    )
+    if pgs:
+        # Collect the subtitle timeline during the existing video scan. No separate
+        # pass per language (or per file) is needed, even for a late first cue.
+        def video_and_subtitles(line):
+            stream, _, tail = line.partition(",")
+            if not stream.isdigit():
+                # ffprobe may put video packet side-data on a continuation line.
+                if not stream.strip() or stream.startswith("SHA256:"):
+                    return
+                raise ValueError("视频缺少可还原的显示时间戳。")
+            track = int(stream)
+            if track != index and track not in pgs:
+                return
+            fields = tail.split(",")
+            if track == index:
+                selected = [fields[0], fields[2], fields[4]] if with_end else [fields[0], fields[4]]
+                video_packet(selected)
+            else:
+                # An empty side-data section can add a trailing CSV column.
+                if (len(fields) < 6 or fields[0] == "N/A" or
+                        not re.fullmatch(r"SHA256:[0-9a-fA-F]{64}", fields[5])):
+                    raise ValueError("PGS 字幕数据包缺少有效的时间戳或内容校验值。")
+                pts, dts, duration = (None if value == "N/A" else round(float(value) * 1_000_000)
+                                      for value in fields[:3])
+                pgs[track].append((pts, dts, duration, bytes.fromhex(fields[5][7:])))
+
+        run([_tool("ffprobe"), "-v", "error", "-show_packets", "-show_data_hash", "sha256",
+             "-show_entries", "packet=stream_index,pts_time,dts_time,duration_time,size,pos,data_hash:packet_side_data=",
+             "-of", "csv=p=0", path], video_and_subtitles, collect=False)
+    else:
+        entries = "packet=pts_time" + (",duration_time" if with_end else "")
+        if on_position is not None:
+            entries += ",pos"
+        run([_tool("ffprobe"), "-v", "error", "-select_streams", str(index), "-show_packets",
+             "-show_entries", entries + ":packet_side_data=", "-of", "csv=p=0", path],
+            lambda line: video_packet(line.split(",")), collect=False)
     if not times or len(set(times)) != len(times):
         raise ValueError("视频显示时间戳为空或重复，无法保证逐帧同步。")
     if not coded_order:
@@ -478,7 +546,15 @@ def _static_hdr(path, video, run):
     return master, cll
 
 
-def _extract(source, video_index, dest, run, *, limit=None, downstream=None):
+def _ffmpeg_frames(on_frame):
+    def report(line):
+        key, _, value = line.partition("=")
+        if key == "frame" and value.strip().isdigit():
+            on_frame(int(value))
+    return report
+
+
+def _extract(source, video_index, dest, run, *, limit=None, downstream=None, on_frame=None):
     args = [
         _tool("ffmpeg"),
         "-nostdin",
@@ -498,11 +574,15 @@ def _extract(source, video_index, dest, run, *, limit=None, downstream=None):
         dest,
     ]
     if downstream is None:
-        run(args)
+        if on_frame is None:
+            run(args)
+        else:
+            args[1:1] = ["-nostats", "-progress", "pipe:1"]
+            run(args, _ffmpeg_frames(on_frame), collect=False)
     else:
         import profile7
 
-        profile7.run_pipe(args, downstream, run, Path(downstream[-1]).parent)
+        profile7.run_ffmpeg_pipe(args, downstream, run, Path(downstream[-1]).parent, on_frame=on_frame)
 
 
 def _vbv_limit(info):
@@ -678,21 +758,6 @@ def _software_command(source, out, info, video, mode, target, master, cll):
     ]
 
 
-def _software_encode(source, out, info, video, mode, target, master, cll, run, progress):
-    name = "神经网络超分" if mode == "neural" else "高位深缩放"
-
-    def report(line):
-        if line.startswith("out_time_us=") and info["duration"] > 0:
-            val = line.split("=", 1)[1]
-            if val.lstrip("-").isdigit():
-                progress(
-                    12 + max(0, min(1, int(val) / 1e6 / info["duration"])) * 60,
-                    name + "与 x265 高质量编码",
-                )
-
-    run(_software_command(source, out, info, video, mode, target, master, cll), report)
-
-
 def _mkv_inventory(path, run):
     return json.loads(run([_tool("mkvmerge"), "-J", path]))
 
@@ -724,22 +789,22 @@ def _audio_starts(path, data, run):
     return result
 
 
-def _hash_container(path, cancel, progress, *, copy_to=None):
+def _hash_container(path, cancel, progress, *, copy_to=None, bounds=None):
     """Hash the copy as it is written, then independently hash the file read back."""
     digest = hashlib.sha256()
     size = path.stat().st_size
-    first, text = (84, "复制并校验原始 MKV") if copy_to else (95, "逐字节回读双层 MKV")
-    last = -1
+    if copy_to is not None:
+        stage = _Stage(progress, "copy", "复制并计算原始 MKV 校验值", "bytes", *(bounds or (84, 90)))
+    else:
+        stage = _Stage(progress, "readback", "逐字节回读并核对 MKV 校验值", "bytes", *(bounds or (95, 99)))
+    stage(0, size)
     with path.open("rb") as incoming:
         while block := incoming.read(8 * 1024 * 1024):
             _check_cancel(cancel)
-            if copy_to:
+            if copy_to is not None:
                 copy_to.write(block)
             digest.update(block)
-            percent = first + int(4 * incoming.tell() / max(size, 1))
-            if percent != last:
-                progress(percent, text)
-                last = percent
+            stage(incoming.tell(), size)
     return digest.hexdigest()
 
 
@@ -763,7 +828,7 @@ def _chapter_xml(path, chapters, language):
     ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
 
 
-def _mux(source, encoded, out, info, timing, original, run, audio_starts, chapter_file=None):
+def _mux(source, encoded, out, info, timing, original, run, audio_starts, chapter_file=None, *, progress=None):
     video = [t for t in original["tracks"] if t["type"] == "video"][info.get("base_ordinal", 0)]
     props = video["properties"]
     fps = _ratio(info["fps"])
@@ -816,7 +881,15 @@ def _mux(source, encoded, out, info, timing, original, run, audio_starts, chapte
                 if track["type"] in {"audio", "subtitles"}:
                     args += ["--sync", f"{track['id']}:{round(earliest * 1000)}"]
     args.append(source)
-    run(args)
+    if progress is None:
+        run(args)
+    else:
+        args.insert(1, "--gui-mode")
+        def status(line):
+            match = re.fullmatch(r"#GUI#progress (\d+)%", line)
+            if match:
+                progress(int(match[1]), 100)
+        run(args, status, collect=False)
 
 
 def _text_cues(path, indexes, run):
@@ -836,8 +909,24 @@ def _text_cues(path, indexes, run):
     return rows
 
 
+def _pgs_tracks(data):
+    return {s["index"]: [] for s in data["streams"] if s.get("codec_name") == "hdmv_pgs_subtitle"}
+
+
+def _same_pgs(before, after):
+    # Our MKV timecode scale is 100 microseconds. Keep exact times when the
+    # original already falls on that grid; otherwise allow container rounding.
+    def same_time(a, b):
+        return a == b or (a is not None and b is not None and a % 100 != 0 and abs(a - b) < 100)
+
+    return len(before) == len(after) and all(
+        a[3] == b[3] and all(same_time(x, y) for x, y in zip(a[:3], b[:3]))
+        for a, b in zip(before, after)
+    )
+
+
 def _verify_other(source, output, original, result, chapter_streams, explicit_chapter_ends,
-                  source_path, output_path, run):
+                  source_path, output_path, run, *, pgs_packets=None):
     def tracks(data):
         return [t for t in data["tracks"] if t["type"] != "video"]
 
@@ -887,6 +976,12 @@ def _verify_other(source, output, original, result, chapter_streams, explicit_ch
             raise ValueError("音轨声道数或采样率发生变化。")
         if (sc, dc) == ("mov_text", "subrip"):
             converted.append((s["index"], d["index"]))
+        elif sc == "hdmv_pgs_subtitle" and pgs_packets is not None:
+            # Sparse subtitle stream.start_time depends on probing depth. Verify the
+            # displayed and cleared subtitles themselves, including their order.
+            before, after = pgs_packets
+            if not _same_pgs(before[s["index"]], after[d["index"]]):
+                raise ValueError("PGS 字幕的内容、显示时间、时长或顺序发生了变化。")
         elif s["codec_type"] == "subtitle" and "start_time" in s and "start_time" in d:
             if abs(float(s["start_time"]) - float(d["start_time"])) > 0.003:
                 raise ValueError("字幕轨的起始时间发生了变化。")
@@ -997,6 +1092,16 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
     copy_container = (
         (native or copy_video) and info["el_index"] is None and original["container"].get("type") == "Matroska"
     )
+    measure_light = info["source_type"] == "sdr" or (is_hdr10 and not author_native)
+    # The percentage describes the work in this route. Optional scans get their
+    # own range only when needed; copying a native track has no encoding phase.
+    scan_end = 5 if native or copy_video or author_native else 3
+    prep_end = 20 if copy_container else 42 if native or copy_video or author_native else 8
+    encode_start = scan_end if info["source_type"] == "sdr" else prep_end
+    encode_end = 32 if measure_light else 85
+    mux_start = prep_end if native or copy_video else 90
+    verify_start = 58 if copy_container else 78 if native or copy_video else 94
+    timeline_end = 65 if copy_container else 85 if native or copy_video else 96
     if not original.get("container", {}).get("supported") or sum(
         t["type"] == "video" for t in original.get("tracks", [])
     ) != (2 if info["el_index"] is not None else 1):
@@ -1008,10 +1113,18 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
     with tempfile.TemporaryDirectory(dir=dest.parent, prefix=".hdr-render-") as folder:
         scratch = Path(folder)
         run.worker_cancel = scratch / "cancel.rtx"
-        progress(2, "读取原片逐帧时间戳")
-        coded_times, video_end = _times(source, video["index"], run, coded_order=True, with_end=True)
+        split_timeline = info["el_index"] is not None
+        base_end = (1 + scan_end) / 2 if split_timeline else scan_end
+        scan = _Stage(progress, "scan", "读取原片逐帧时间戳", "bytes", 1, base_end)
+        scan(0, before.st_size)
+        input_pgs = {} if copy_container else _pgs_tracks(data)
+        coded_times, video_end = _times(source, video["index"], run, coded_order=True, with_end=True,
+                                        on_position=lambda n: scan(n, before.st_size), pgs=input_pgs)
         if info["el_index"] is not None:
-            el_times = _times(source, info["el_index"], run, coded_order=True)
+            el_scan = _Stage(progress, "scan_el", "核对增强层逐帧时间戳", "bytes", base_end, scan_end)
+            el_scan(0, before.st_size)
+            el_times = _times(source, info["el_index"], run, coded_order=True,
+                              on_position=lambda n: el_scan(n, before.st_size))
             if len(coded_times) != len(el_times) or any(
                 abs(a - b) > 2 for a, b in zip(coded_times, el_times)
             ):
@@ -1042,15 +1155,33 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
         base_layer_copied = False
         generation_levels = {}
         measured_levels = None
+        frame_total = len(times)
+        prep_mid = (scan_end + prep_end) / 2
+        prep = _Stage(progress, "extract", "提取原始视频轨", "frames", scan_end, prep_mid)
+
+        def extract_original(src, index, out, runner, **options):
+            # A split EL is a second stream; use a distinct stage and numerator.
+            if split_timeline:
+                is_el = index == info["el_index"]
+                middle = (scan_end + prep_mid) / 2
+                meter = _Stage(progress, "extract_el" if is_el else "extract",
+                               "提取增强层视频轨" if is_el else "提取基础层视频轨", "frames",
+                               middle if is_el else scan_end, prep_mid if is_el else middle)
+            else:
+                meter = prep
+            meter(0, frame_total)
+            return _extract(src, index, out, runner, on_frame=lambda n: meter(n, frame_total), **options)
+
         if is_hdr10:
             from hdr10 import NativeMetadata
             from profile7 import signature
 
-            progress(5, "读取原始 HDR10 编码画面与母版显示信息")
             original_es = encoded if author_native else scratch / "original-hdr10.hevc"
-            _extract(source, video["index"], original_es, run)
+            extract_original(source, video["index"], original_es, run)
             metadata = NativeMetadata()
-            source_signature = signature(original_es, cancel, inspect_unit=metadata.observe)
+            original_check = _Stage(progress, "source_hash", "核对原始 HDR10 编码画面与母版信息",
+                                    "bytes", prep_mid, prep_end)
+            source_signature = signature(original_es, cancel, inspect_unit=metadata.observe, progress=original_check)
             if source_signature[0] != len(times):
                 raise ValueError("HDR10 基础层图像数与显示时间戳数不符。")
             generation_levels = metadata.level6()
@@ -1066,7 +1197,6 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
         elif info["dv_profile"] == 7:
             import profile7
 
-            progress(4, "拆分并逐帧核对 Profile 7 基础层、增强层与 RPU")
             base, el, original_rpu, layer, _ = profile7.prepare(
                 source,
                 video["index"],
@@ -1075,15 +1205,20 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
                 info["width"],
                 info["height"],
                 len(times),
-                _extract,
+                extract_original,
                 _tool("ffprobe"),
                 run,
             )
             info["enhancement_layer"] = layer
             master, cll = _static_hdr(source, video, run)
             if native:
-                progress(10, "校验原始双层视频并复制编码画面")
-                signatures = tuple(profile7.signature(p, cancel) for p in (base, el))
+                middle = (prep_mid + prep_end) / 2
+                signatures = (
+                    profile7.signature(base, cancel, progress=_Stage(
+                        progress, "base_hash", "核对原始基础层", "bytes", prep_mid, middle)),
+                    profile7.signature(el, cancel, progress=_Stage(
+                        progress, "el_hash", "核对原始增强层", "bytes", middle, prep_end)),
+                )
                 if any(frames != len(times) for frames, _ in signatures):
                     raise ValueError("双层编码图像数与原片显示帧数不符。")
                 if not copy_container:
@@ -1110,7 +1245,8 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
 
                     dv_master, dv_cll = static_from_rpu(rpu, scratch, run, source_master=master)
                     master, cll = dv_master or master, dv_cll or cll
-                    progress(8, "逐帧合成基础层与 FEL 残差")
+                    fel = _Stage(progress, "encode", "逐帧合成杜比增强层并编码", "frames", encode_start, encode_end)
+                    fel(0, frame_total)
                     streamed = True
                     if mode == "rtx":
                         command = _gpu_command(
@@ -1131,19 +1267,21 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
                         info["height"],
                         len(times),
                         run,
-                        progress,
+                        lambda _, message: progress(encode_start, message) if fel.last <= 0 else None,
                         encoder_command=command,
+                        on_frame=lambda n: fel(n, frame_total),
                     )
                 elif layer == "MEL" and mode == "reference" and info["can_keep7"]:
                     # MEL has no picture residual. Mode 2 above keeps its mapping
                     # and changes the RPU to P8.1; the HDR10 base stays bit exact.
-                    picture_signature = profile7.signature(base, cancel, ignore_rpu=True)
+                    picture_signature = profile7.signature(base, cancel, ignore_rpu=True, progress=_Stage(
+                        progress, "base_hash", "核对 MEL 原始基础层", "bytes", prep_mid, encode_end))
                     if picture_signature[0] != len(times):
                         raise ValueError("MEL 基础层的编码图像数与原片显示帧数不符。")
                     encoded = base
                     base_layer_copied = True
                     streamed = True
-                    progress(72, "已保留 MEL 原始基础层，正在转换逐帧动态元数据")
+                    progress(encode_end, "已保留 MEL 原始基础层，正在转换逐帧动态元数据")
                 else:
                     picture = scratch / "base.mkv"
                     run(
@@ -1163,12 +1301,12 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
                 base.unlink()
             el.unlink()
         elif target == "preserve":
-            progress(5, "提取杜比视界元数据并换算有效画面尺寸")
+            progress(scan_end, "提取杜比视界元数据并换算有效画面尺寸")
             # dovi_tool reads single-track Matroska directly. A native MKV
             # therefore needs no temporary copy of the full elementary stream.
             source_es = source if copy_container else scratch / "original.hevc"
             if source_es != source:
-                _extract(source, video["index"], source_es, run)
+                extract_original(source, video["index"], source_es, run)
             if info["dv_profile"] == 5:
                 from profile5 import prepare_profile5_rpu
 
@@ -1189,7 +1327,8 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
                 from profile7 import signature
 
                 encoded = source_es
-                picture_signature = signature(encoded, cancel)
+                picture_signature = signature(encoded, cancel, progress=_Stage(
+                    progress, "source_hash", "核对原始视频码流", "bytes", prep_mid, prep_end))
                 if picture_signature[0] != len(times):
                     raise ValueError("原片编码图像数和显示帧数不一致。")
             elif source_es != source:
@@ -1207,58 +1346,61 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
                 "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)",
                 None,
             )
-        if not native and not copy_video and not streamed:
-            progress(12, "生成 4K 10 位 PQ 视频")
         has_rpu = target == "preserve" and mode in {"quality", "rtx"}
         if copy_video:
-            progress(74, "已保留原始单层视频与逐帧动态元数据")
+            progress(prep_end, "已保留原始单层视频与逐帧动态元数据")
         elif native:
-            progress(74, "已保留原始双层视频")
+            progress(prep_end, "已保留原始双层视频")
         elif not streamed and (has_rpu or mode == "rtx"):
             from ai import rtx_status
 
             cmd = _gpu_command(picture, encoded, info, mode, target, rpu, master, cll)
-            first_frame_time = None
-            first_frame_count = 0
+            rtx = mode == "rtx"
+            encode = _Stage(progress, "encode", "RTX 超分与 HEVC 编码" if rtx else "NVIDIA 高位深缩放与 HEVC 编码",
+                            "frames" if rtx else "percent", encode_start, encode_end)
+            encode(0, frame_total if rtx else 100)
 
             def nv_progress(line):
-                nonlocal first_frame_time, first_frame_count
                 status = rtx_status(line)
-                if status:
-                    progress(12, status)
+                if status and encode.last <= 0:
+                    progress(encode_start, status)
                 if line.startswith("progress_frame=") and line[15:].isdigit():
-                    current = int(line[15:])
-                    now = time.monotonic()
-                    rate_text = ""
-                    if first_frame_time is None:
-                        first_frame_time, first_frame_count = now, current
-                    elif now > first_frame_time and current > first_frame_count:
-                        rate_text = f" · {(current - first_frame_count) / (now - first_frame_time):.1f} fps"
-                    progress(
-                        12 + min(1, current / len(times)) * 60,
-                        f"RTX 超分  ·  {current:,} / {len(times):,} 帧{rate_text}",
-                    )
+                    encode(int(line[15:]), frame_total)
                     return
-                if mode == "rtx":
+                if rtx:
                     return
-                m = re.search(r"(\d+(?:\.\d+)?)%", line)
+                m = re.match(r"\[?\s*(\d+(?:\.\d+)?)%", line)
                 if m:
-                    progress(12 + min(100, float(m[1])) * 0.6, "NVIDIA 高位深缩放与 HEVC 编码")
+                    encode(float(m[1]), 100)
 
-            run(cmd, nv_progress)
+            run(cmd, nv_progress, collect=False)
         elif not streamed:
-            _software_encode(
-                picture, encoded, info, picture_video, mode, target, master, cll, run, progress
-            )
+            name = "神经网络超分" if mode == "neural" else "高位深缩放"
+            encode = _Stage(progress, "encode", name + "与 x265 编码", "frames", encode_start, encode_end)
+            encode(0, frame_total)
+            cmd = _software_command(picture, encoded, info, picture_video, mode, target, master, cll)
+            run(cmd, _ffmpeg_frames(lambda n: encode(n, frame_total)), collect=False)
         if picture != source:
             picture.unlink()
-        if info["source_type"] == "sdr" or (is_hdr10 and not author_native):
+        scene_start = prep_end
+        if measure_light:
             from hdr10 import measure_content_light, write_content_light
 
-            progress(72, "逐帧测量最终编码画面的 MaxCLL 和 MaxFALL")
-            measured_levels = measure_content_light(encoded, canvas, offsets, len(times), scratch, run)
+            primary_end, refine_end = (75, 81) if target == "newdv" else (84, 88)
+            primary = _Stage(progress, "light", "逐帧测量 MaxCLL 与 MaxFALL", "frames", encode_end, primary_end)
+            refine = _Stage(progress, "light_refine", "精测临界亮度值", "frames", primary_end, refine_end)
+            primary(0, frame_total)
+            def light_progress(current, total, key):
+                (refine if key == "light_refine" else primary)(current, total)
+            measured_levels = measure_content_light(encoded, canvas, offsets, frame_total, scratch, run,
+                                                    progress=light_progress)
             signalled = scratch / "measured-light.hevc"
-            write_content_light(encoded, signalled, measured_levels, cancel)
+            write_start = refine_end if refine.last >= 0 else primary_end
+            scene_start = write_start + 2 if target == "newdv" else mux_start
+            write = _Stage(progress, "light_write", "写入实测 HDR10 亮度", "bytes", write_start, scene_start)
+            encoded_size = encoded.stat().st_size
+            write(0, encoded_size)
+            write_content_light(encoded, signalled, measured_levels, cancel, on_bytes=lambda n: write(n, encoded_size))
             encoded.unlink()
             encoded = signalled
             peak, frame_average = measured_levels
@@ -1267,19 +1409,22 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
         if target == "newdv":
             from hdr import measure_output
 
-            progress(73, "测量新 HDR 画面的逐镜亮度")
-            measurements = measure_output(encoded, scratch, run, active_area=offsets)
+            scenes = _Stage(progress, "scenes", "测量杜比视界逐镜亮度", "frames", scene_start, 88)
+            scenes(0, frame_total)
+            measurements = measure_output(encoded, scratch, run, active_area=offsets, expected_frames=frame_total,
+                                          progress=lambda n, total, key: scenes(n, total))
+            progress(88, "生成逐帧杜比视界元数据")
             meta = dovi.generate_rpu_from_measurements(measurements, rpu, scratch, run,
                                                        **generation_levels, **area_options)
             if meta["frame_count"] != len(times):
                 raise ValueError("新生成的 RPU 帧数与原视频不一致。")
         if target not in {"hdr10", "keep7"} and not has_rpu and not copy_video:
-            progress(81, "写入逐帧杜比视界元数据")
+            progress(89, "写入逐帧杜比视界元数据")
             injected = scratch / "with-rpu.hevc"
             run([dovi.find_dovi_tool(), "inject-rpu", "-i", encoded, "-r", rpu, "-o", injected])
             encoded.unlink()
             encoded = injected
-        progress(84, "按原时间戳封装视频及原片轨道")
+        progress(mux_start, "读取封装所需的音轨与章节")
         muxed = scratch / "verified.mkv"
         starts = _audio_starts(source, data, run)
         chapter_streams = _chapter_streams(source, data)
@@ -1291,11 +1436,14 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
         container_digest = None
         if copy_container:
             with muxed.open("xb") as outgoing:
-                container_digest = _hash_container(source, cancel, progress, copy_to=outgoing)
+                container_digest = _hash_container(source, cancel, progress, copy_to=outgoing,
+                                                   bounds=(mux_start, verify_start))
         else:
-            _mux(source, encoded, muxed, info, timing, original, run, starts, chapter_file)
+            mux = _Stage(progress, "mux", "按原时间戳封装视频及原片轨道", "percent", mux_start, verify_start)
+            mux(0, 100)
+            _mux(source, encoded, muxed, info, timing, original, run, starts, chapter_file, progress=mux)
             encoded.unlink()
-        progress(90, "复读输出并核验逐帧时间、色彩与副轨")
+        progress(verify_start, "复读输出并核验尺寸与色彩信令")
         out_data = _probe(muxed, run)
         out_video = _video(out_data)
         if (out_video["width"], out_video["height"]) != (
@@ -1332,17 +1480,23 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
             tier, dv_level = _check_dv_tier(muxed, out_video, cfg, cap, run)
         elif any("dv_profile" in s for s in out_video.get("side_data_list", [])):
             raise ValueError("HDR10 输出意外携带杜比视界配置。")
-        out_times, out_end = _times(muxed, out_video["index"], run, with_end=True)
+        timeline = _Stage(progress, "verify", "复核成片逐帧显示时间", "frames", verify_start, timeline_end)
+        timeline(0, frame_total)
+        output_pgs = {} if copy_container else _pgs_tracks(out_data)
+        out_times, out_end = _times(muxed, out_video["index"], run, with_end=True,
+                                    on_frame=lambda n: timeline(n, frame_total), pgs=output_pgs)
         if len(out_times) != len(times) or max(abs(a - b) for a, b in zip(times, out_times)) > 1200:
             raise ValueError("输出帧数或逐帧显示时间与原片不一致。")
         if video_end is not None and (out_end is None or abs(video_end - out_end) > 1200):
             raise ValueError("输出视频的末帧显示时长与原片不一致。")
+        progress(timeline_end, "核验 HDR 母版、音字幕轨与章节")
         out_master, out_cll = _static_hdr(muxed, out_video, run)
         if (master and master != out_master) or (cll and cll != out_cll):
             raise ValueError("成片中的静态 HDR 母版或内容亮度与预期不符。")
         _verify_other(
             data, out_data, original, _mkv_inventory(muxed, run), chapter_streams,
             bool(chapter_file), source, muxed, run,
+            pgs_packets=None if copy_container else (input_pgs, output_pgs),
         )
         for a, b in zip(starts, _audio_starts(muxed, out_data, run)):
             # Match encoded packets by hash, not by index: container-specific
@@ -1361,11 +1515,14 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
                         raise ValueError("封装后音轨相对视频发生时移。")
         digest = None
         if copy_container:
-            if _hash_container(muxed, cancel, progress) != container_digest:
+            if _hash_container(muxed, cancel, progress, bounds=(timeline_end, 99)) != container_digest:
                 raise ValueError("原样保留的 MKV 整文件 SHA-256 回读不一致。")
             digest = dovi._digest(rpu)
         elif native:
-            progress(95, "逐层复核基础层、增强层和原始动态元数据")
+            layers = _Stage(progress, "verify_layers", "拆分成片并核验双层视频", "frames", timeline_end, 92)
+            layers(0, frame_total)
+            def extract_layers(src, index, out, runner, **options):
+                return _extract(src, index, out, runner, on_frame=lambda n: layers(n, frame_total), **options)
             review = scratch / "readback"
             review.mkdir()
             bl_out, el_out, rpu_out, out_layer, _ = profile7.prepare(
@@ -1376,11 +1533,16 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
                 info["width"],
                 info["height"],
                 len(times),
-                _extract,
+                extract_layers,
                 _tool("ffprobe"),
                 run,
             )
-            verified_layers = tuple(profile7.signature(p, cancel) for p in (bl_out, el_out))
+            verified_layers = (
+                profile7.signature(bl_out, cancel, progress=_Stage(
+                    progress, "verify_base", "回读并核对成片基础层", "bytes", 92, 96)),
+                profile7.signature(el_out, cancel, progress=_Stage(
+                    progress, "verify_el", "回读并核对成片增强层", "bytes", 96, 99)),
+            )
             digest = dovi._digest(rpu_out)
             if (
                 verified_layers != signatures
@@ -1389,15 +1551,39 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
             ):
                 raise ValueError("成片 BL、EL 或原始 RPU 字节校验失败。")
         elif target != "hdr10":
+            rpu_start = timeline_end
             if copy_video or base_layer_copied:
                 from profile7 import signature
 
                 readback = scratch / "readback.hevc"
-                _extract(muxed, out_video["index"], readback, run)
-                if signature(readback, cancel, ignore_rpu=base_layer_copied) != picture_signature:
+                midpoint = timeline_end + (99 - timeline_end) / 3
+                rpu_start = timeline_end + 2 * (99 - timeline_end) / 3
+                frames = _Stage(progress, "verify_extract", "提取成片视频并复核编码画面", "frames",
+                                timeline_end, midpoint)
+                frames(0, frame_total)
+                _extract(muxed, out_video["index"], readback, run, on_frame=lambda n: frames(n, frame_total))
+                picture_check = _Stage(progress, "verify_picture", "核对成片编码画面与参数集",
+                                       "bytes", midpoint, rpu_start)
+                if signature(readback, cancel, ignore_rpu=base_layer_copied, progress=picture_check) != picture_signature:
                     raise ValueError("无损封装后的 HEVC 编码画面、参数集或附加数据发生变化。")
-            progress(95, "逐帧复核最终文件内的 RPU")
-            verification = dovi.verify_rpu(rpu, muxed, scratch, run, **area_options)
+            expected_size = rpu.stat().st_size
+            rpu_check = _Stage(progress, "verify_rpu", "回读成片杜比视界元数据", "bytes", rpu_start, 99)
+            def verify_tool(args):
+                if args[1] != "extract-rpu":
+                    return run(args)
+                extracted = Path(args[args.index("-o") + 1])
+                def report_bytes():
+                    # dovi_tool creates this file after it has parsed the video.
+                    try:
+                        rpu_check(extracted.stat().st_size, expected_size)
+                    except FileNotFoundError:
+                        pass
+                rpu_check(0, expected_size)
+                output = run(args, on_poll=report_bytes)
+                report_bytes()
+                progress(99, "核对杜比视界帧数及 SHA-256")
+                return output
+            verification = dovi.verify_rpu(rpu, muxed, scratch, verify_tool, **area_options)
             digest = verification["rpu_sha256"]
         _check_cancel(cancel)
         after = source.stat()

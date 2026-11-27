@@ -48,10 +48,10 @@ def _write_pq_table(path):
             table.write(f"{sample} {sample} {sample}\n")
 
 
-def measure_content_light(encoded, canvas, offsets, expected_frames, workdir, run):
+def measure_content_light(encoded, canvas, offsets, expected_frames, workdir, run, *, progress=None):
     """Measure MaxCLL and MaxFALL from all active pixels, in whole nits (rounded up)."""
     from engine import _tool
-    from profile7 import run_pipe
+    from profile7 import run_ffmpeg_pipe
 
     width, height = canvas
     left, right, top, bottom = dovi.validate_active_area(offsets, width, height)
@@ -93,24 +93,35 @@ def measure_content_light(encoded, canvas, offsets, expected_frames, workdir, ru
                    f"ametadata=print:file={filter_path(stats)}")
         measure = [*ff, "-f", "f32le", "-ar", "48000", "-ac", "1", "-i", "pipe:0",
                    "-filter_threads", "1", "-af", filters, "-f", "null", "-"]
-        def analyze(graph):
+        def analyze(graph, phase):
             # Splitting a chroma reconstruction into independently processed
             # slices can change peaks near slice boundaries. Decode in parallel,
             # but run this spatial filter on the uninterrupted source raster.
             decode = [*ff, "-noauto_conversion_filters", "-filter_complex_threads", "1", "-i", str(encoded),
                       "-filter_complex", graph + "[maxrgb]", "-map", "[maxrgb]", "-fps_mode", "passthrough",
                       "-threads", "1", "-f", "rawvideo", "pipe:1"]
-            run_pipe(decode, measure, run, tmp, failure="HDR10 内容亮度测量失败。")
-            return _levels_from_stats(stats, expected_frames, pixels, getattr(run, "cancel", None))
+            def report(frames):
+                # The consumer still has to validate all per-frame pixel counts.
+                if frames < expected_frames:
+                    progress(frames, expected_frames, phase)
 
-        levels = analyze(to_rgb + f"lut1d=file={filter_path(table)}:interp=linear,format=gbrpf32le," + max_rgb)
+            if progress is not None:
+                progress(0, expected_frames, phase)
+            run_ffmpeg_pipe(decode, measure, run, tmp, on_frame=report if progress is not None else None,
+                            failure="HDR10 内容亮度测量失败。")
+            result = _levels_from_stats(stats, expected_frames, pixels, getattr(run, "cancel", None))
+            if progress is not None:
+                progress(expected_frames, expected_frames, phase)
+            return result
+
+        levels = analyze(to_rgb + f"lut1d=file={filter_path(table)}:interp=linear,format=gbrpf32le," + max_rgb, "light")
         # Resolve an integer signalling boundary using zimg's non-approximated
         # EOTF. LUT interpolation and float arithmetic cannot cross a boundary
         # outside this margin. Black and PQ reference peak are exact endpoints.
         if any(0 < n < 10000 and abs(n - round(n)) < 0.02 for n in levels):
             levels = analyze(to_rgb + max_rgb + ",setparams=colorspace=bt2020nc:color_trc=smpte2084:range=full,"
                 "zscale=min=2020_ncl:m=2020_ncl:rin=full:r=full:tin=smpte2084:t=linear:"
-                "npl=10000:agamma=0,format=grayf32le")
+                "npl=10000:agamma=0,format=grayf32le", "light_refine")
         peak, mean = levels
         # Text statistics have six fractional decimal places. A single very
         # dim pixel on a black UHD frame still makes its true mean positive.

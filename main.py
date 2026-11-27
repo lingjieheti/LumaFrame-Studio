@@ -25,7 +25,7 @@ import threading
 import time
 from datetime import datetime
 from fractions import Fraction
-from PySide6.QtCore import Qt, QEvent, QRectF, QSettings, Signal, QUrl, QTimer, QObject
+from PySide6.QtCore import Qt, QEvent, QRectF, QSettings, Signal, QUrl, QTimer, QObject, QLocale, QLibraryInfo, QTranslator
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QComboBox,
     QCheckBox,
+    QAbstractButton,
     QLineEdit,
     QProgressBar,
     QFileDialog,
@@ -60,10 +61,12 @@ from PySide6.QtWidgets import (
     QSpinBox,
 )
 import glass
+from export_progress import ExportProgress, ProgressFeed, ProgressFile, clock_text, eta_text, rate_text, work_text
 from glass import ASSETS, GlassButton, Material, Rail, Stage, Select, ink
 from material_sample import MaterialSample
+from localization import LANGUAGES, Translator, resolve_language
 
-VERSION = "1.4.2"
+VERSION = "1.5.2"
 REPO = "https://github.com/lingjieheti/LumaFrame-Studio"
 SPONSOR = "https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md"
 TARGETS = {
@@ -119,8 +122,9 @@ def label(text, kind=""):
 class ElidedLabel(QLabel):
     """Keep the full text available to assistive tools while fitting the current width."""
 
-    def __init__(self, text, kind):
+    def __init__(self, text, kind, elide=Qt.ElideMiddle):
         super().__init__(text)
+        self.elide = elide
         self.setObjectName(kind)
         self.setTextFormat(Qt.PlainText)
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
@@ -129,7 +133,7 @@ class ElidedLabel(QLabel):
         area = self.contentsRect()
         painter = QPainter(self)
         painter.setPen(self.palette().color(QPalette.WindowText))
-        caption = self.fontMetrics().elidedText(self.text(), Qt.ElideMiddle, area.width())
+        caption = self.fontMetrics().elidedText(self.text(), self.elide, area.width())
         painter.drawText(area, self.alignment() | Qt.TextSingleLine, caption)
 
 
@@ -233,7 +237,7 @@ class Events(QObject):
     inspected = Signal(int, object, str)
     inspection_done = Signal(object)
     poster = Signal(int, bytes)
-    state = Signal(float, str)
+    state = Signal(float, str, object, float)
     complete = Signal(object, str)
     gpu = Signal(str)
 
@@ -242,6 +246,14 @@ class Studio(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = QSettings("LumaFrame", "Studio")
+        default_language = "zh-CN" if self.settings.allKeys() else "auto"
+        choice = self.settings.value("uiLanguage", default_language)
+        self.language_choice = choice if choice in ("auto", *LANGUAGES) else "auto"
+        if self.settings.value("uiLanguage") != self.language_choice:
+            self.settings.setValue("uiLanguage", self.language_choice)
+        self.words = Translator(resolve_language(self.language_choice, QLocale.system().uiLanguages()))
+        self.captions = {}
+        self.static_properties = []
         self.dark = self.settings.value("dark", False, type=bool)
         self.solid = self.settings.value("reduceTransparency", False, type=bool)
         self.allow_transparency, self.allow_motion = glass.system_effects()
@@ -255,6 +267,8 @@ class Studio(QMainWindow):
         self.resize(min(1120, width), min(680, height))
         self.info = None
         self.busy = False
+        self.progress_tracker = ExportProgress()
+        self.started_at = None
         self.custom_destination = None
         self.failure_detail = ""
         self.seq = 0
@@ -334,12 +348,12 @@ class Studio(QMainWindow):
         self.stack = QStackedWidget()
         outer.addWidget(self.stack, 1)
         self.workspace = self.page("影片工作台")
+        self.workspace_viewport = self.stack.widget(0).findChild(QScrollArea).viewport()
         box = self.workspace
         self.stage = Stage()
         self.stage.dropFile.connect(self.load)
         box.addWidget(self.stage, 1)
-        sl = layout(QVBoxLayout, self.stage, 26, 7)
-        sl.setContentsMargins(29, 20, 27, 21)
+        sl = layout(QVBoxLayout, self.stage)
         sl.addStretch()
         self.film = ElidedLabel("导入影片", "heroTitle")
         sl.addWidget(self.film)
@@ -354,6 +368,8 @@ class Studio(QMainWindow):
         self.pick.clicked.connect(self.choose)
         sl.addWidget(self.pick)
         sl.addStretch()
+        self.size_preview(False)
+        self.workspace_viewport.installEventFilter(self)
         card = QFrame()
         card.setObjectName("card")
         box.addWidget(card)
@@ -365,7 +381,7 @@ class Studio(QMainWindow):
         self.gpu_label = label("检测图形设备…", "device")
         section.addWidget(self.gpu_label)
         cg.addLayout(section)
-        self.events.gpu.connect(self.gpu_label.setText)
+        self.events.gpu.connect(self.gpu_name)
         self.targets = Select()
         self.modes = Select()
         self.speeds = Select()
@@ -467,23 +483,43 @@ class Studio(QMainWindow):
         self.modes.currentIndexChanged.connect(self.mode_change)
         self.speeds.currentIndexChanged.connect(self.speed_change)
         box.addStretch()
-        self.status = label("", "status")
-        self.status.hide()
-        self.status.setWordWrap(True)
-        dock = QFrame()
-        dock.setObjectName("actions")
-        dock_layout = layout(QVBoxLayout, dock, 0, 7)
-        dock_layout.setContentsMargins(0, 8, 0, 0)
-        self.page_host.addWidget(dock)
-        dock_layout.addWidget(self.status)
+        self.export_dock = glass.ExportDock()
+        self.export_dock.setObjectName("exportDock")
+        dock_layout = layout(QVBoxLayout, self.export_dock, 0, 9)
+        dock_layout.setContentsMargins(18, 11, 18, 11)
+        self.page_host.addWidget(self.export_dock)
+        self.status = ElidedLabel("选择影片后即可导出", "status", Qt.ElideRight)
+        self.status.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.bar = QProgressBar()
-        self.bar.setRange(0, 100)
+        self.bar.setRange(0, 1000)
+        self.bar.setAccessibleName("导出总进度")
         self.bar.setTextVisible(False)
-        self.bar.setFixedHeight(5)
+        self.bar.setFixedHeight(7)
         self.bar.hide()
+        self.progress_metrics = QWidget()
+        metrics = QGridLayout(self.progress_metrics)
+        metrics.setContentsMargins(0, 0, 0, 0)
+        metrics.setVerticalSpacing(0)
+        metrics.setHorizontalSpacing(10)
+        self.percent_value = label("0%", "dockPercent")
+        self.total_eta = label("估算中…", "dockEta")
+        self.stage_eta = label("估算中…", "progressMetric")
+        self.speed_value = label("—", "progressMetric")
+        for column, (caption, value) in enumerate((
+            ("导出总进度", self.percent_value), ("预计总剩余", self.total_eta),
+            ("本阶段剩余", self.stage_eta), ("处理速度", self.speed_value)
+        )):
+            metrics.addWidget(label(caption, "dockCaption"), 0, column)
+            metrics.addWidget(value, 1, column, Qt.AlignLeft | Qt.AlignVCenter)
+            metrics.setColumnStretch(column, 2 if column == 1 else 1)
+            value.setAccessibleName(caption)
+        self.total_eta.setToolTip("根据当前阶段的实测速率和后续步骤估算，切换阶段后重新计算。")
+        self.progress_metrics.hide()
+        dock_layout.addWidget(self.progress_metrics)
         dock_layout.addWidget(self.bar)
         foot = QWidget()
         fh = layout(QHBoxLayout, foot, 0, 8)
+        fh.addWidget(self.status, 1)
         self.openbtn = GlassButton("打开目录", "folder")
         self.openbtn.setFixedWidth(115)
         self.openbtn.clicked.connect(self.open_output)
@@ -494,7 +530,6 @@ class Studio(QMainWindow):
         self.detailbtn.clicked.connect(self.show_failure)
         self.detailbtn.hide()
         fh.addWidget(self.detailbtn)
-        fh.addStretch()
         self.stopbtn = GlassButton("取消")
         self.stopbtn.setFixedWidth(82)
         self.stopbtn.clicked.connect(self.stop)
@@ -516,6 +551,18 @@ class Studio(QMainWindow):
         h.addWidget(self.history_host)
         h.addStretch()
         pref = self.page("外观与指南")
+        language_row = layout(QHBoxLayout, None, 0, 12)
+        language_label = label("界面语言", "field")
+        self.languages = Select()
+        language_label.setBuddy(self.languages)
+        self.languages.setAccessibleName("界面语言")
+        self.languages.addItem("跟随系统", "auto")
+        for code, autonym in LANGUAGES.items():
+            self.languages.addItem(autonym, code)
+        self.languages.setCurrentIndex(self.languages.findData(self.language_choice))
+        language_row.addWidget(language_label)
+        language_row.addWidget(self.languages, 1)
+        pref.addLayout(language_row)
         surface = QFrame()
         surface.setObjectName("card")
         swatch_row = layout(QHBoxLayout, surface, 21, 24)
@@ -584,11 +631,12 @@ class Studio(QMainWindow):
         pref.addWidget(guide)
         pref.addWidget(label("LumaFrame Studio   " + VERSION, "muted"))
         pref.addStretch()
+        self.capture_interface_text()
+        self.languages.currentIndexChanged.connect(self.change_language)
         self.show_page(0)
         self.set_controls(False)
         self.refill_targets()
-        self.apply_style()
-        self.refresh_history()
+        self.translate_interface()
         QShortcut(QKeySequence.Open, self, activated=self.choose)
 
         def probe_gpu():
@@ -609,6 +657,76 @@ class Studio(QMainWindow):
                 return
 
         threading.Thread(target=probe_gpu, daemon=True).start()
+
+    def capture_interface_text(self):
+        # Capture application-owned labels before loading a film or building history.
+        for widget in self.findChildren(QWidget):
+            if isinstance(widget, (QLabel, QAbstractButton)) and widget.text():
+                self.captions[widget] = widget.text()
+            for getter, setter in (("toolTip", "setToolTip"), ("accessibleName", "setAccessibleName"),
+                                   ("placeholderText", "setPlaceholderText")):
+                read = getattr(widget, getter, None)
+                if read and (text := read()):
+                    self.static_properties.append((getattr(widget, setter), text))
+        for combo in (self.speeds, self.sdr_mapping, self.area_choice, self.languages):
+            for i in range(combo.count()):
+                combo.setItemData(i, combo.itemText(i), Qt.UserRole + 1)
+
+    def caption(self, widget, source):
+        self.captions[widget] = source
+        widget.setText(source() if callable(source) else self.words.text(source))
+        if widget is self.status:
+            widget.setToolTip(widget.text())
+
+    def gpu_name(self, name):
+        self.caption(self.gpu_label, name if name == "未检测到 NVIDIA GPU" else lambda: name)
+
+    def option_text(self, source):
+        if source.endswith(" · 居中有效画面"):
+            return self.words.text("{ratio} · 居中有效画面", ratio=source.split(" · ")[0])
+        if source.startswith("杜比视界 Profile ") and " → " in source:
+            return self.words.text("杜比视界 Profile {profile} → Profile 8.1", profile=source.split()[2])
+        return self.words.text(source)
+
+    def add_option(self, combo, source, value):
+        combo.addItem(self.option_text(source), value)
+        combo.setItemData(combo.count() - 1, source, Qt.UserRole + 1)
+
+    def change_language(self):
+        self.language_choice = self.languages.currentData()
+        self.settings.setValue("uiLanguage", self.language_choice)
+        self.words = Translator(resolve_language(self.language_choice, QLocale.system().uiLanguages()))
+        self.translate_interface()
+
+    def translate_interface(self):
+        app = QApplication.instance()
+        previous = getattr(app, "_studio_qt_translation", None)
+        if previous is not None:
+            app.removeTranslator(previous)
+        qt_translation = QTranslator(app)
+        qt_locale = {"zh-CN": "zh_CN", "ja": "ja"}.get(self.words.code)
+        if qt_locale and qt_translation.load("qtbase_" + qt_locale, QLibraryInfo.path(QLibraryInfo.TranslationsPath)):
+            app.installTranslator(qt_translation)
+        app._studio_qt_translation = qt_translation
+        if previous is not None:
+            previous.deleteLater()
+        self.apply_style()
+        for widget, source in self.captions.items():
+            widget.setText(source() if callable(source) else self.words.text(source))
+        for setter, source in self.static_properties:
+            setter(self.words.text(source))
+        self.status.setToolTip(self.status.text())
+        for combo in (self.speeds, self.sdr_mapping, self.area_choice, self.languages, self.targets, self.modes):
+            for i in range(combo.count()):
+                source = combo.itemData(i, Qt.UserRole + 1)
+                if source:
+                    combo.setItemText(i, self.option_text(source))
+        self.resize_rail()
+        if self.info and self.info.get("supported"):
+            self.mode_change()
+        self.refresh_history()
+        if self.busy:
+            self.show_progress()
 
     def page(self, title):
         page = QWidget()
@@ -638,12 +756,15 @@ class Studio(QMainWindow):
         super().resizeEvent(event)
         if not hasattr(self, "setting_fields"):
             return
+        self.resize_rail()
+        self.arrange_fields()
+
+    def resize_rail(self):
         compact = self.width() < 920
         self.rail.setFixedWidth(68 if compact else 192)
         self.brandtext.setVisible(not compact)
         for button, caption in self.rail_labels:
-            button.setText("" if compact else caption)
-        self.arrange_fields()
+            button.setText("" if compact else self.words.text(caption))
 
     def arrange_fields(self):
         columns = 1 if self.width() < 775 else 2
@@ -661,7 +782,20 @@ class Studio(QMainWindow):
             span = 2 if columns == 2 and group is self.speed_field else 1
             self.setting_fields.addWidget(group, row, col, 1, span)
 
+    def size_preview(self, compact):
+        self.compact_preview = compact
+        self.stage.setMinimumHeight(148 if compact else 211)
+        self.stage.setMaximumHeight(166 if compact else 260)
+        margins = (21, 8, 21, 8) if compact else (29, 20, 27, 21)
+        self.stage.layout().setContentsMargins(*margins)
+        self.stage.layout().setSpacing(3 if compact else 7)
+        self.film.setStyleSheet("font-size: 27px;" if compact else "")
+
     def eventFilter(self, obj, event):
+        if obj is getattr(self, "workspace_viewport", None) and event.type() == QEvent.Resize:
+            compact = event.size().height() < 400
+            if compact != self.compact_preview:
+                self.size_preview(compact)
         if obj is getattr(self, "stage", None) and event.type() == QEvent.Resize:
             width = self.stage.width()
             self.film.setMaximumWidth(max(230, int(width * 0.57)))
@@ -687,9 +821,9 @@ class Studio(QMainWindow):
     def density_change(self, n):
         self.density = n
         self.settings.setValue("glassDensity", n)
-        self.density_value.setText(f"{n}%")
+        self.caption(self.density_value, f"{n}%")
         self.material_sample.update()
-        for w in self.findChildren(Rail) + self.findChildren(GlassButton):
+        for w in self.findChildren(Rail) + self.findChildren(GlassButton) + self.findChildren(glass.ExportDock):
             w.update()
 
     def apply_style(self):
@@ -715,8 +849,10 @@ class Studio(QMainWindow):
         ]:
             palette.setColor(role, QColor(c))
         self.setPalette(palette)
+        interface_fonts = {"en": "'Segoe UI','Microsoft YaHei UI'", "ja": "'Yu Gothic UI','Meiryo UI','Segoe UI'"}
+        fonts = interface_fonts.get(self.words.code, "'Microsoft YaHei UI','Segoe UI'")
         self.setStyleSheet(f"""
-        QWidget {{font-family:'Microsoft YaHei UI','Segoe UI';font-size:14px;color:{fg};}}
+        QWidget {{font-family:{fonts};font-size:14px;color:{fg};}}
         QScrollArea,QScrollArea>QWidget>QWidget,#sheet, QLabel {{background:transparent;}}
         QLabel#title {{font-size:29px;font-weight:700;}}
         QLabel#section {{font-size:19px;font-weight:650;}}
@@ -728,9 +864,12 @@ class Studio(QMainWindow):
         QLabel#field {{font-size:13px;font-weight:600;color:{mut};}}
         QLabel#guideTitle {{font-size:15px;font-weight:650;}}
         QLabel#status {{font-size:13px;font-weight:500;}}
+        QLabel#dockCaption {{font-size:12px;font-weight:500;color:{mut};}}
+        QLabel#dockPercent {{font-size:29px;font-weight:700;color:{accent};}}
+        QLabel#dockEta {{font-size:25px;font-weight:650;color:{fg};}}
+        QLabel#progressMetric {{font-size:15px;font-weight:600;color:{fg};}}
         QFrame#card {{background:{card};border:1px solid {edge};border-radius:20px;}}
         QFrame#rule {{background:{edge};border:0;}}
-        QFrame#actions {{background:transparent;border:0;border-top:1px solid {edge};}}
         QLineEdit,QComboBox,QSpinBox {{background:{field_bg};padding:7px 12px;border-radius:10px;border:1px solid {edge};min-height:20px;}}
         QComboBox {{padding-right:28px;}}
         QComboBox:disabled {{color:{mut};}}
@@ -740,8 +879,8 @@ class Studio(QMainWindow):
         QComboBox::drop-down {{border:0;width:26px;background:transparent;}}
         QComboBox::down-arrow {{width:0;height:0;}}
         QComboBox QAbstractItemView {{background:{card};color:{fg};selection-background-color:#5356ba;selection-color:white;padding:5px;border:1px solid {edge};}}
-        QProgressBar {{background:{edge};border:none;border-radius:2px;}}
-        QProgressBar::chunk {{background:{accent};border-radius:2px;}}
+        QProgressBar {{background:{edge};border:none;border-radius:3px;}}
+        QProgressBar::chunk {{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 {accent},stop:1 {'#89c6f7' if self.dark else '#4681bd'});border-radius:3px;}}
         QSlider::groove:horizontal {{background:{edge};height:4px;border-radius:2px;}}
         QSlider::sub-page:horizontal {{background:{accent};border-radius:2px;}}
         QSlider::handle:horizontal {{background:{card};border:1px solid {mut};width:16px;margin:-7px 0;border-radius:8px;}}
@@ -769,9 +908,9 @@ class Studio(QMainWindow):
             return
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "选择影片",
+            self.words.text("选择影片"),
             self.settings.value("inputDir", ""),
-            "视频文件 (*.mkv *.mp4 *.mov *.m4v *.ts *.m2ts *.avi *.webm);;所有文件 (*)",
+            self.words.text("视频文件 (*.mkv *.mp4 *.mov *.m4v *.ts *.m2ts *.avi *.webm);;所有文件 (*)"),
         )
         if path:
             self.load(path)
@@ -793,13 +932,15 @@ class Studio(QMainWindow):
         self.openbtn.hide()
         self.detailbtn.hide()
         self.bar.hide()
+        self.progress_metrics.hide()
         self.path.clear()
+        self.path.setToolTip("")
         self.refill_targets()
-        self.film.setText(Path(path).name)
+        self.caption(self.film, lambda: Path(path).name)
         self.film.setToolTip(Path(path).name)
-        self.film_detail.setText("正在读取视频轨道…")
-        self.pick.setText("更换影片")
-        self.status.setText("正在检测片源格式")
+        self.caption(self.film_detail, "正在读取视频轨道…")
+        self.caption(self.pick, "更换影片")
+        self.caption(self.status, "正在检测片源格式")
         self.status.show()
         self.settings.setValue("inputDir", str(Path(path).parent))
 
@@ -846,22 +987,22 @@ class Studio(QMainWindow):
         self.info = info
         self.status.show()
         if err:
-            self.film_detail.setText("无法读取影片")
-            self.status.setText(err[:450])
+            self.caption(self.film_detail, "无法读取影片")
+            self.caption(self.status, lambda: self.words.message(err)[:450])
             return
         fps = float(Fraction(info["fps"] or 0))
-        self.film_detail.setText(
-            f"{info['width']} × {info['height']}   ·   {fps:.3f} fps   ·   {info['profile'] or '未识别格式'}"
-        )
+        self.caption(self.film_detail, lambda: f"{info['width']} × {info['height']}   ·   {fps:.3f} fps   ·   "
+                     + self.words.message(info["profile"] or "未识别格式"))
         self.set_controls(info["supported"])
         self.refill_targets()
-        details = info["reason"]
-        if info["supported"]:
-            details = (
-                f"将导出 {info['target_width']} × {info['target_height']}，含 {info['audio_count']} 条音轨、"
-                f"{info['subtitle_count']} 条字幕。{details}"
-            )
-        self.status.setText(details)
+        def description():
+            details = self.words.message(info["reason"])
+            if not info["supported"]:
+                return details
+            return self.words.text("将导出 {width} × {height}，含 {audio} 条音轨、{subs} 条字幕。{details}",
+                                   width=info["target_width"], height=info["target_height"],
+                                   audio=info["audio_count"], subs=info["subtitle_count"], details=details)
+        self.caption(self.status, description)
 
     def refill_targets(self):
         self.targets.blockSignals(True)
@@ -881,7 +1022,7 @@ class Studio(QMainWindow):
             caption = TARGETS[key]
             if key == "preserve" and info.get("dv_profile") in (5, 7):
                 caption = f"杜比视界 Profile {info['dv_profile']} → Profile 8.1"
-            self.targets.addItem(caption, key)
+            self.add_option(self.targets, caption, key)
         self.targets.setCurrentIndex(0)
         self.targets.blockSignals(False)
         self.target_change()
@@ -926,7 +1067,7 @@ class Studio(QMainWindow):
                 name = "保留原始基础层 · 转换杜比元数据"
             elif key == "reference" and self.info.get("source_type") == "sdr":
                 name = "Spline36 · 高位深扩展"
-            self.modes.addItem(name, key)
+            self.add_option(self.modes, name, key)
         self.modes.setCurrentIndex(0)
         self.modes.blockSignals(False)
         self.mode_change()
@@ -945,24 +1086,25 @@ class Studio(QMainWindow):
             "reference": "使用高位深 Spline36 与 x265 慢速编码。画面有移动细纹、织物或胶片纹理时，可先试转比较。",
             "quality": "采用 NVIDIA Image Scaling 与硬件编码，适合快速导出。",
         }
-        text = tips.get(key, "")
+        tr = self.words.text
+        text = tr(tips.get(key, ""))
         if self.targets.currentData() == "keep7":
-            text = "直接保留原始画质和逐帧杜比数据。此格式需要支持 Profile 7 的播放器。"
+            text = tr("直接保留原始画质和逐帧杜比数据。此格式需要支持 Profile 7 的播放器。")
         elif self.info and self.info.get("dv_profile") == 7 and self.targets.currentData() == "preserve":
-            text += " 导出前会读取增强层，生成 HDR10 兼容的单层 Profile 8.1。"
+            text += " " + tr("导出前会读取增强层，生成 HDR10 兼容的单层 Profile 8.1。")
             if (key == "reference" and self.info.get("can_keep7")
                     and self.info.get("profile", "").endswith(" · MEL")):
-                text = "全片确认为 MEL 时，沿用原始 HEVC 基础层，并将逐帧杜比元数据转换为 Profile 8.1。"
+                text = tr("全片确认为 MEL 时，沿用原始 HEVC 基础层，并将逐帧杜比元数据转换为 Profile 8.1。")
             if "FEL" in self.info.get("profile", ""):
-                text += " 重建的 12 位画面逐帧送入后续处理，请为分层码流和成片封装预留磁盘空间。"
+                text += " " + tr("重建的 12 位画面逐帧送入后续处理，请为分层码流和成片封装预留磁盘空间。")
         elif self.info and self.info.get("source_type") == "hdr10" and key == "copy":
-            text = "沿用原始 HDR10 画面和母版亮度，逐镜测量生成杜比动态元数据。"
+            text = tr("沿用原始 HDR10 画面和母版亮度，逐镜测量生成杜比动态元数据。")
         elif self.targets.currentData() == "newdv":
-            text += " 按新画面测量生成杜比动态元数据。"
+            text += " " + tr("按新画面测量生成杜比动态元数据。")
         if rtx_speed:
             if self.speeds.currentData() == "fast":
-                text += " 并行加速增加缓冲，让超分与编码并行。"
-            text += " 两档使用相同的超分模型和编码参数。"
+                text += " " + tr("并行加速增加缓冲，让超分与编码并行。")
+            text += " " + tr("两档使用相同的超分模型和编码参数。")
         self.hint.setText(text)
         self.hint.setVisible(bool(self.info and self.info.get("supported") and text))
 
@@ -974,25 +1116,21 @@ class Studio(QMainWindow):
         if not self.info or not self.info["supported"]:
             return
         src = Path(self.info["path"])
-        dest = Path(self.settings.value("outputDir", str(src.parent)))
-        if not dest.is_dir():
-            dest = src.parent
         suffix = {"hdr10": "-4K-HDR10", "keep7": "-4K-DV-P7"}.get(self.targets.currentData(), "-4K-DV")
-        f = available_destination(self.custom_destination or dest / (src.stem + suffix + ".mkv"))
+        f = available_destination(self.custom_destination or src.with_name(src.stem + suffix + ".mkv"))
         self.path.setText(str(f))
         self.path.setToolTip(str(f))
         self.path.setCursorPosition(0)
 
     def set_destination(self):
         f, _ = QFileDialog.getSaveFileName(
-            self, "保存 4K 影片", self.path.text(), "Matroska 影片 (*.mkv)",
+            self, self.words.text("保存 4K 影片"), self.path.text(), self.words.text("Matroska 影片 (*.mkv)"),
             options=QFileDialog.Option.DontConfirmOverwrite,
         )
         if f:
             if not f.lower().endswith(".mkv"):
                 f += ".mkv"
             self.custom_destination = Path(f)
-            self.settings.setValue("outputDir", str(Path(f).parent))
             self.suggest_dest()
 
     def start(self, *, sample=False):
@@ -1003,7 +1141,7 @@ class Studio(QMainWindow):
         self.suggest_dest()
         dest = Path(self.path.text())
         if sample:
-            dest = available_destination(dest.with_name(dest.stem + "-试片.mkv"))
+            dest = available_destination(dest.with_name(dest.stem + "-" + self.words.text("试片") + ".mkv"))
         dest = str(dest)
         src = self.info["path"]
         mode = self.modes.currentData()
@@ -1020,18 +1158,22 @@ class Studio(QMainWindow):
             try:
                 active_area = dovi.validate_active_area(margins, *canvas)
             except ValueError as exc:
-                self.status.setText(str(exc))
+                self.caption(self.status, lambda error=str(exc): self.words.message(error))
                 self.status.show()
                 return
         self.busy = True
         self.cancel_event = threading.Event()
         self.started_at = time.monotonic()
+        self.progress_tracker = ExportProgress()
+        feed = ProgressFeed(self.events.state.emit)
         self.progress_value = 0
         self.stage_message = "正在准备试片" if sample else "正在准备导出"
         self.set_controls(False)
         self.pick.setDisabled(True)
         self.stopbtn.setEnabled(True)
         self.stopbtn.show()
+        self.previewbtn.hide()
+        self.renderbtn.hide()
         self.openbtn.hide()
         self.detailbtn.hide()
         self.bar.setValue(0)
@@ -1050,7 +1192,7 @@ class Studio(QMainWindow):
                         src,
                         dest,
                         mode,
-                        self.events.state.emit,
+                        feed,
                         self.cancel_event,
                         target=target,
                         duration=self.info["duration"],
@@ -1060,7 +1202,7 @@ class Studio(QMainWindow):
                     )
                 else:
                     res = engine.render(
-                        src, dest, mode, self.events.state.emit, self.cancel_event, target=target,
+                        src, dest, mode, feed, self.cancel_event, target=target,
                         sdr_mapping=mapping, active_area=active_area, speed=speed,
                     )
                 self.events.complete.emit(res, "")
@@ -1069,23 +1211,38 @@ class Studio(QMainWindow):
 
         threading.Thread(target=run, daemon=True).start()
 
-    def update_progress(self, n, msg):
+    def update_progress(self, n, msg, work=None, now=None):
         if not self.busy or self.cancel_event.is_set():
             return
-        self.progress_value = max(self.progress_value, min(int(n), 100))
+        self.progress_tracker.update(n, work, time.monotonic() if now is None else now)
+        self.progress_value = self.progress_tracker.percent
         self.stage_message = msg
-        self.bar.setValue(self.progress_value)
+        self.bar.setValue(round(self.progress_value * 10))
         self.show_progress()
 
     def show_progress(self):
-        if self.busy:
-            self.status.show()
-            elapsed = int(time.monotonic() - self.started_at)
-            minutes, seconds = divmod(elapsed, 60)
-            hours, minutes = divmod(minutes, 60)
-            self.status.setText(
-                f"{self.progress_value}%  ·  {self.stage_message}  ·  已用 {hours:02}:{minutes:02}:{seconds:02}"
-            )
+        if not self.busy:
+            return
+        now = time.monotonic()
+        work = self.progress_tracker.work
+        percent = f"{self.progress_value:.1f}".removesuffix(".0") + "%"
+        tr = self.words.text
+        self.percent_value.setText(percent)
+        parts = [self.words.message(self.stage_message)]
+        cancelling = self.cancel_event.is_set()
+        if work and not cancelling:
+            parts.append(work_text(work, tr))
+        parts.append(tr("已用 {time}", time=clock_text(now - self.started_at)))
+        self.status.setText("  ·  ".join(parts))
+        self.status.setToolTip(self.status.text())
+        self.status.show()
+        self.setWindowTitle(f"{percent} · LumaFrame Studio")
+        self.progress_metrics.setVisible(not cancelling)
+        if not cancelling:
+            rate, phase_eta, total_eta = self.progress_tracker.estimates(now)
+            self.total_eta.setText(eta_text(total_eta, tr))
+            self.stage_eta.setText(tr("收尾中…") if work and work.done >= work.total else eta_text(phase_eta, tr))
+            self.speed_value.setText(rate_text(rate, work, tr))
 
     def stop(self):
         self.cancel_event.set()
@@ -1096,17 +1253,26 @@ class Studio(QMainWindow):
     def finished(self, res, err):
         self.busy = False
         self.clock.stop()
+        self.progress_metrics.hide()
+        self.setWindowTitle("LumaFrame Studio")
         self.pick.setEnabled(True)
         self.set_controls(True)
         self.stopbtn.hide()
+        self.previewbtn.show()
+        self.renderbtn.show()
         if res:
             self.last_output = res["path"]
-            self.bar.setValue(100)
+            self.bar.setValue(self.bar.maximum())
+            elapsed = clock_text(time.monotonic() - self.started_at) if self.started_at is not None else None
             self.openbtn.show()
-            self.status.setText(
-                f"已校验 {res['frame_count']:,} 帧   ·   {res['width']} × {res['height']}   ·   "
-                + Path(self.last_output).name
-            )
+            def summary():
+                parts = ["100%", self.words.text("已校验 {frames:,} 帧", frames=res["frame_count"]),
+                         f"{res['width']} × {res['height']}"]
+                if elapsed is not None:
+                    parts.append(self.words.text("用时 {time}", time=elapsed))
+                parts.append(Path(res["path"]).name)
+                return "   ·   ".join(parts)
+            self.caption(self.status, summary)
             self.history.insert(
                 0,
                 {
@@ -1122,11 +1288,12 @@ class Studio(QMainWindow):
             self.suggest_dest()
         elif self.cancel_event.is_set():
             self.bar.hide()
-            self.status.setText("导出已取消")
+            self.caption(self.status, "导出已取消")
         else:
             self.bar.hide()
             self.failure_detail = err.strip() or "媒体处理失败"
-            self.status.setText("导出未完成 · " + self.failure_detail.splitlines()[0][:250])
+            self.caption(self.status, lambda: self.words.text("导出未完成 · {error}",
+                         error=self.words.message(self.failure_detail).splitlines()[0][:250]))
             self.detailbtn.show()
         if getattr(self, "close_after", False):
             self.close()
@@ -1134,9 +1301,9 @@ class Studio(QMainWindow):
     def show_failure(self):
         box = QMessageBox(self)
         box.setAttribute(Qt.WA_DeleteOnClose)
-        box.setWindowTitle("导出未完成")
+        box.setWindowTitle(self.words.text("导出未完成"))
         box.setTextFormat(Qt.PlainText)
-        box.setText(self.failure_detail.splitlines()[0][:250])
+        box.setText(self.words.message(self.failure_detail).splitlines()[0][:250])
         box.setDetailedText(self.failure_detail[-12000:])
         box.open()
 
@@ -1150,8 +1317,8 @@ class Studio(QMainWindow):
             frame.setObjectName("card")
             v = layout(QVBoxLayout, frame, 32, 9)
             v.addWidget(Glyph("history", 32), 0, Qt.AlignHCenter)
-            v.addWidget(label("暂无导出记录", "section"), 0, Qt.AlignHCenter)
-            v.addWidget(label("完成导出后，可在这里打开成片目录。", "muted"), 0, Qt.AlignHCenter)
+            v.addWidget(label(self.words.text("暂无导出记录"), "section"), 0, Qt.AlignHCenter)
+            v.addWidget(label(self.words.text("完成导出后，可在这里打开成片目录。"), "muted"), 0, Qt.AlignHCenter)
             self.history_list.addWidget(frame)
             return
         for r in self.history:
@@ -1167,15 +1334,14 @@ class Studio(QMainWindow):
                 label(
                     r["time"]
                     + "   ·   "
-                    + TARGETS.get(r["target"], "")
+                    + self.words.text(TARGETS.get(r["target"], ""))
                     + "   ·   "
-                    + str(r["n"])
-                    + " 帧",
+                    + self.words.text("{frames} 帧", frames=r["n"]),
                     "muted",
                 )
             )
             h.addWidget(desc, 1)
-            b = GlassButton("目录", "folder")
+            b = GlassButton(self.words.text("目录"), "folder")
             b.setFixedWidth(82)
             b.clicked.connect(lambda _, p=r["path"]: shell_path(Path(p).parent))
             h.addWidget(b)
@@ -1195,8 +1361,8 @@ class Studio(QMainWindow):
             if (
                 QMessageBox.question(
                     self,
-                    "正在导出",
-                    "取消当前导出并关闭工作台？",
+                    self.words.text("正在导出"),
+                    self.words.text("取消当前导出并关闭工作台？"),
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.No,
                 )
@@ -1235,6 +1401,9 @@ def export_command(argv):
     parser.add_argument("input")
     parser.add_argument("--output", required=True)
     parser.add_argument("--result", required=True, help="New JSON file for the verification result")
+    parser.add_argument("--language", choices=("auto", *LANGUAGES), default="zh-CN",
+                        help="Language of human-readable progress and errors; JSON keys stay the same")
+    parser.add_argument("--progress-file", help="New JSON file for live progress, processing speed and estimated time remaining")
     parser.add_argument("--target", choices=tuple(TARGETS))
     parser.add_argument("--mode", choices=tuple(MODES))
     parser.add_argument("--speed", choices=("quality", "fast"), default="quality",
@@ -1245,13 +1414,23 @@ def export_command(argv):
     parser.add_argument("--active-area", type=int, nargs=4, metavar=("LEFT", "RIGHT", "TOP", "BOTTOM"),
                         help="New HDR10 or Dolby Vision: fixed analysis insets in output pixels, keeping the full canvas")
     options = parser.parse_args(argv)
+    words = Translator(resolve_language(options.language, QLocale.system().uiLanguages()))
     result_file = Path(options.result)
+    media_paths = {Path(options.input).resolve(), Path(options.output).resolve()}
+    if result_file.resolve() in media_paths:
+        return 2
     try:
         report = result_file.open("x", encoding="utf-8")
     except OSError:
         return 2
     with report:
+        live = None
         try:
+            if options.progress_file:
+                if Path(options.progress_file).resolve() in media_paths | {result_file.resolve()}:
+                    raise ValueError("进度文件必须与片源、成片和验收结果使用不同的路径。")
+                live = ProgressFile(options.progress_file, words.message)
+            progress = live.feed if live else (lambda *_: None)
             if options.sample or not options.target or not options.mode:
                 data = engine.inspect_source(options.input)
                 if not data["supported"]:
@@ -1273,7 +1452,7 @@ def export_command(argv):
                     options.input,
                     options.output,
                     options.mode,
-                    lambda *_: None,
+                    progress,
                     threading.Event(),
                     target=options.target,
                     duration=data["duration"],
@@ -1286,17 +1465,26 @@ def export_command(argv):
                     options.input,
                     options.output,
                     options.mode,
-                    lambda *_: None,
+                    progress,
                     threading.Event(),
                     target=options.target,
                     sdr_mapping=options.sdr_mapping,
                     active_area=options.active_area,
                     speed=options.speed,
                 )
+            if live:
+                telemetry_error = live.finish("completed", "成片已校验")
+                if telemetry_error:
+                    result = {**result, "progress_file_error": telemetry_error}
             json.dump(result, report, ensure_ascii=False, indent=2)
             return 0
         except Exception as exc:
-            json.dump({"verified": False, "error": str(exc)}, report, ensure_ascii=False, indent=2)
+            failure = {"verified": False, "error": words.message(str(exc))}
+            if live:
+                telemetry_error = live.finish("failed", str(exc))
+                if telemetry_error:
+                    failure["progress_file_error"] = telemetry_error
+            json.dump(failure, report, ensure_ascii=False, indent=2)
             return 1
 
 

@@ -89,7 +89,11 @@ class ContentLight(unittest.TestCase):
                         "transfer=16:colormatrix=9:log-level=error", src]
                     subprocess.run(args, input=raw, check=True)
                     peak, base_nits = reference_nits(940, cb, cr), reference_nits(y, cb, cr)
-                    measured = hdr10.measure_content_light(src,(width,height),None,2,tmp,run)
+                    events = []
+                    measured = hdr10.measure_content_light(src,(width,height),None,2,tmp,run,
+                                                          progress=lambda *event: events.append(event))
+                    self.assertEqual(events[0], (0, 2, "light"))
+                    self.assertEqual(events[-1][:2], (2, 2))
                     self.assertEqual(measured,(math.ceil(peak),math.ceil((peak+(n-1)*base_nits)/n)))
                     masked = hdr10.measure_content_light(src,(width,height),(1,2,1,0),2,tmp,run)
                     self.assertEqual(masked,(math.ceil(base_nits),)*2)

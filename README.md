@@ -4,7 +4,17 @@
 
 [从官网下载](https://www.lingjie.cyou/projects/lumaframe-studio/) · [GitHub Releases](https://github.com/lingjieheti/LumaFrame-Studio/releases/latest) · [超分实测](docs/quality.md) · [双层画质验证](docs/profile7.md) · [赞助作者](https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md)
 
-**1.4.2 RTX 速度模式** 在导出设置里选择「速度模式」。并行加速使用额外的内存缓冲，让显卡处理下一帧时，上一帧可以同时送往色彩转换和编码。两档使用相同的 RTX 超分模型、强度、10 位色彩转换和 HEVC 编码参数。试转与整片导出共用所选设置。命令行可在 RTX 导出命令中加入 `--speed fast`。[速度与画质实测](docs/speed-1.4.2.md)
+**1.5.2 矮窗口布局** 在笔记本和较高 Windows 缩放比例下，工作台会依据实际可用高度收紧顶部影片预览。输出格式选择框保持完整可见，导出时仍可直接看到进度和剩余时间。
+
+**H.264 试片** 在带 B 帧的开放 GOP 素材中，截取中段可能会带入依赖前一组画面的帧，导致旧版报时间戳错误。新版按可解码的帧边界截取约 5 秒的试片，再进行超分和成片校验。
+
+**1.5.0 多语言界面** 在「外观与指南 → 界面语言」中可选简体中文、English、日本語或跟随系统，导出期间也能切换。新安装默认跟随系统，已有偏好的旧版用户升级后沿用中文。命令行可用 `--language en` 或 `--language ja` 选择进度和错误提示的语言，JSON 字段名和状态值保持兼容。
+
+本版修复蓝光 PGS 字幕重新封装后可能被误判为时间偏移的问题。新打开的影片默认输出到片源目录，可为单部影片手动更改保存位置。
+
+**1.5.1 玻璃导出栏** 试转或整片导出时，工作台底部以大号数字并列显示总进度和整片预计剩余时间，旁边列出本阶段剩余时间和实时速度。下方显示正在执行的步骤、已处理帧数或数据量、已用时间，以及取消按钮。刚开始和切换阶段时会先显示「估算中」，取得足够的实测速率后再显示时间。成片通过校验后显示 100%。操作栏随深浅主题、玻璃浓度和减少透明度偏好调整。
+
+**RTX 速度模式** 在导出设置里选择「速度模式」。并行加速使用额外的内存缓冲，让显卡处理下一帧时，上一帧可以同时送往色彩转换和编码。两档使用相同的 RTX 超分模型、强度、10 位色彩转换和 HEVC 编码参数。试转与整片导出共用所选设置。命令行可在 RTX 导出命令中加入 `--speed fast`。[速度与画质实测](docs/speed-1.4.2.md)
 
 低于目标尺寸的静态 HDR10 可直接超分至 4K HDR10 或杜比视界。新编码的 HDR10 和杜比文件按最终画面实测 MaxCLL/MaxFALL，支持指定电影黑边。[片源和实测](docs/quality-1.4.1.md) · [跨方案与运动压力测试](docs/coverage-1.4.1.md) · [压缩片源修复](docs/compressed-1.4.md) · [新制杜比的剪辑识别](docs/scene-analysis-1.4.1.md)
 
@@ -67,7 +77,7 @@ Windows 安装包使用 Inno Setup 6。可先运行桌面冒烟检查，再打�
 .\tools\build.ps1 -Python (Resolve-Path .\.venv\Scripts\python.exe).Path -InnoCompiler "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 ```
 
-命令行可通过同一处理引擎运行。输出文件和 JSON 结果文件需使用新文件名。
+命令行可通过同一处理引擎运行。需要跟踪批量任务时，可选用 `--progress-file live.json`，读取其中的进度、速度和预计剩余秒数。剩余时间处于估算中时为 `null`。输出文件、进度和验收结果分别使用新文件名。
 
 ```powershell
 .\LumaFrameStudio.exe --export movie.mkv --target preserve --mode neural --output movie-4K.mkv --result result.json

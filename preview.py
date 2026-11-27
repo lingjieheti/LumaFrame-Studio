@@ -1,9 +1,42 @@
 """Create a video-only sample, then process it through the usual encoder and verifier."""
 
+from fractions import Fraction
+import json
 from pathlib import Path
 import tempfile
 
 import engine
+
+
+def _h264_sample_filter(nearby, run):
+    # A stream-copy cut at DTS can keep undecodable leading B pictures from
+    # the previous open GOP and a future reference picture past the sample end.
+    data = json.loads(run([engine._tool("ffprobe"), "-v", "fatal", "-select_streams", "v:0",
+                           "-read_intervals", "%+6", "-show_packets", "-show_frames",
+                           "-show_entries", "packet=pts,pos,flags:frame=pkt_pos:stream=time_base",
+                           "-of", "json", nearby]))
+    events = data.get("packets_and_frames", [])
+    packets = [row for row in events if row["type"] == "packet"]
+    decoded = {row["pkt_pos"] for row in events if row["type"] == "frame" and "pkt_pos" in row}
+    if not packets or "K" not in packets[0].get("flags", "") or packets[0].get("pos") not in decoded:
+        return []
+    if any("pts" not in row or "pos" not in row for row in packets):
+        return []
+    start = packets[0]["pts"]
+    first = 1
+    while first < len(packets) and packets[first]["pts"] < start and packets[first]["pos"] not in decoded:
+        first += 1
+
+    # Stop in coded order before a forward reference reaches the endpoint.
+    # Never discard an in-range reference just to keep a dependent B picture.
+    end = start + 5 / Fraction(data["streams"][0]["time_base"])
+    stop = next((n for n in range(first, len(packets)) if packets[n]["pts"] >= end), len(packets))
+    drops = []
+    if first > 1:
+        drops.append(f"between(n,1,{first-1})")
+    if stop < len(packets):
+        drops.append(f"gte(n,{stop})")
+    return ["-bsf:v", "noise=drop='" + "+".join(drops) + "'"] if drops else []
 
 
 def render_sample(source, destination, mode, progress, cancel, *, target, duration, sdr_mapping="expand",
@@ -16,6 +49,7 @@ def render_sample(source, destination, mode, progress, cancel, *, target, durati
     with tempfile.TemporaryDirectory(prefix=".lf-sample-", dir=dest.parent) as work:
         source_data = engine._probe(source, run)
         primary = engine._video(source_data)
+        reordered_avc = primary.get("codec_name") == "h264" and primary.get("has_b_frames", 0) > 0
         split = "_p7_el" in source_data
         initial_maps = ["-map", f"0:{primary['index']}"]
         excerpt_maps = ["-map", "0:V:0"]
@@ -40,7 +74,7 @@ def render_sample(source, destination, mode, progress, cancel, *, target, durati
                 "-i",
                 source,
                 "-t",
-                "5",
+                "6" if reordered_avc else "5",
                 *initial_maps,
                 "-map_metadata",
                 "0",
@@ -60,6 +94,7 @@ def render_sample(source, destination, mode, progress, cancel, *, target, durati
         )
         # Input seeking can retain an entire preceding GOP. Cap time a second
         # time on the short, rebased timeline starting at its real keyframe.
+        sample_filter = _h264_sample_filter(nearby, run) if reordered_avc else []
         run(
             [
                 engine._tool("ffmpeg"),
@@ -75,6 +110,7 @@ def render_sample(source, destination, mode, progress, cancel, *, target, durati
                 "-1",
                 "-c:v",
                 "copy",
+                *sample_filter,
                 "-strict",
                 "unofficial",
                 excerpt,

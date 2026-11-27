@@ -364,6 +364,57 @@ class Rail(QWidget):
         rim(p, rounded(edge, 22.4), edge, .67 if dark else .95)
 
 
+class ExportDock(QWidget):
+    """Glass backing for the export controls; all labels and actions stay native widgets."""
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -3.5)
+        if r.isEmpty():
+            return
+        radius = min(21., r.height() / 2, r.width() / 2)
+        surface = rounded(r, radius)
+        win = self.window()
+        dark = getattr(win, "dark", False)
+        if opaque(win):
+            p.fillPath(surface, QColor("#292d3c" if dark else "#f9faff"))
+            p.setPen(QPen(QColor("#50586c" if dark else "#c5cddd"), 1))
+            p.drawPath(surface)
+            return
+
+        p.fillPath(surface.translated(0, 1.75), QColor(16, 24, 54, 55 if dark else 22))
+        p.save()
+        p.setClipPath(surface)
+        # Borrow diffuse colour from the preview's existing thumbnail, at low
+        # opacity so even very dark or saturated footage stays behind the type.
+        stage = getattr(win, "stage", None)
+        texture = getattr(stage, "frosted", None)
+        if texture is not None and not texture.isNull():
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.setOpacity(.26 if dark else .31)
+            source = QRectF(0, texture.height() * .36, texture.width(), texture.height() * .28)
+            p.drawPixmap(r, texture, source)
+            p.setOpacity(1.)
+        stops = ([(0, "#ca3e4965"), (.43, "#de252a3a"), (1, "#c2393854")] if dark else
+                 [(0, "#bdebf5ff"), (.44, "#dcffffff"), (1, "#bbd9dcf9")])
+        p.fillRect(r, gradient(r, stops))
+        density = max(0, min(100, getattr(win, "density", 45)))
+        p.fillRect(r, QColor(36, 40, 55, density) if dark else QColor(249, 250, 255, density))
+        # A narrow highlight at the rim separates the floating control surface
+        # without laying a bright reflection across the progress text.
+        sheen = QLinearGradient(r.topLeft(), QPointF(r.left(), r.top() + min(28., r.height() * .4)))
+        sheen.setColorAt(0, QColor(246, 252, 255, 28 if dark else 110))
+        sheen.setColorAt(1, QColor(240, 248, 255, 0))
+        p.fillRect(r, sheen)
+        p.restore()
+        p.setPen(QPen(QColor(16, 21, 47, 94 if dark else 42), 1))
+        p.drawPath(surface)
+        inner = r.adjusted(.85, .85, -.85, -.85)
+        if not inner.isEmpty():
+            rim(p, rounded(inner, max(0., radius - .85)), inner, .82 if dark else .98)
+
+
 class Stage(QWidget):
     dropFile = Signal(str)
 
@@ -374,8 +425,6 @@ class Stage(QWidget):
         self._dragging = False
         self._update_frost()
         self.setAcceptDrops(True)
-        self.setMinimumHeight(211)
-        self.setMaximumHeight(260)
 
     def _update_frost(self):
         self.frosted = self.texture().scaled(64, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -388,7 +437,7 @@ class Stage(QWidget):
         self.poster = pix
         self._update_frost()
         self.update()
-        for w in self.window().findChildren(Rail):
+        for w in self.window().findChildren(Rail) + self.window().findChildren(ExportDock):
             w.update()
         for w in self.findChildren(GlassButton):
             w.update()

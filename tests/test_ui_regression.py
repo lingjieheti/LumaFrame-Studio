@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QPoint, QRect, QSettings, Qt
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication
 import main
@@ -26,6 +26,7 @@ class ExportWindowTests(unittest.TestCase):
         temp = self.enterContext(tempfile.TemporaryDirectory())
         self.directory = Path(temp)
         settings = QSettings(str(self.directory / "preferences.ini"), QSettings.IniFormat)
+        settings.setValue("uiLanguage", "zh-CN")
         with patch.object(main, "QSettings", return_value=settings):
             self.window = main.Studio()
         self.addCleanup(self.window.close)
@@ -51,6 +52,30 @@ class ExportWindowTests(unittest.TestCase):
         self.assertEqual(self.window.modes.count(), 1)
         self.assertEqual(self.window.modes.currentData(), "copy")
         self.assertTrue(self.window.mapping_row.isHidden())
+
+    def test_short_viewport_keeps_format_and_export_in_view(self):
+        window = self.window
+        window.setAttribute(Qt.WA_DontShowOnScreen)
+        window.resize(1140, 800)
+        window.show()
+        self.app.processEvents()
+        large_preview = window.stage.height()
+        window.resize(720, 480)
+        for code in ("zh-CN", "en", "ja"):
+            with self.subTest(language=code):
+                window.languages.setCurrentIndex(window.languages.findData(code))
+                self.app.processEvents()
+                for widget, enclosing in ((window.targets, window.workspace_viewport),
+                                          (window.pick, window.stage),
+                                          (window.film_detail, window.stage),
+                                          (window.renderbtn, window)):
+                    rect = QRect(widget.mapTo(enclosing, QPoint()), widget.size())
+                    self.assertTrue(widget.isVisibleTo(enclosing) and enclosing.rect().contains(rect), rect)
+        self.assertLess(window.stage.height(), large_preview)
+        window.languages.setCurrentIndex(window.languages.findData("zh-CN"))
+        window.resize(1140, 800)
+        self.app.processEvents()
+        self.assertEqual(window.stage.height(), large_preview)
 
     def test_static_hdr10_upscale_and_new_dolby_area_apply_to_the_selected_source(self):
         window = self.window
@@ -176,6 +201,14 @@ class ExportWindowTests(unittest.TestCase):
                 self.assertTrue(window.speed_field.isVisible())
                 self.assertTrue(window.renderbtn.isVisible())
 
+    def test_suggested_destination_belongs_to_the_current_movie(self):
+        self.window.settings.setValue("outputDir", str(self.directory / "old export folder"))
+        folder = self.directory / "second movie"
+        folder.mkdir()
+        source = folder / "second.mkv"
+        self.window.got_info(0, dict(self.window.info, path=str(source)), "")
+        self.assertEqual(Path(self.window.path.text()).parent, folder)
+
     def test_existing_names_and_preview_keep_custom_destination(self):
         chosen = self.directory / "自选名称.mkv"
         chosen.write_bytes(b"original")
@@ -208,6 +241,27 @@ class ExportWindowTests(unittest.TestCase):
         self.assertEqual(sample.read_bytes(), b"old preview")
         self.assertEqual(available.read_bytes(), b"another job")
 
+    def test_stage_counter_speed_and_two_etas_follow_the_active_stage(self):
+        from export_progress import Work
+        window = self.window
+        window.busy = True
+        window.started_at = time.monotonic() - 20
+        now = time.monotonic()
+        window.update_progress(10, "编码", Work("encode", 0, 100, "frames"), now - 5)
+        self.assertIn("估算中", window.total_eta.text())
+        window.update_progress(15, "编码", Work("encode", 10, 100, "frames"), now)
+        self.assertFalse(window.progress_metrics.isHidden())
+        self.assertIn("10 / 100 帧", window.status.text())
+        self.assertEqual(window.stage_eta.text(), "约 00:00:45")
+        self.assertEqual(window.total_eta.text(), "约 00:01:25")
+        self.assertEqual(window.speed_value.text(), "2.0 帧/秒")
+        window.update_progress(32, "亮度测量", Work("light", 0, 100, "frames"), now)
+        self.assertIn("估算中", window.stage_eta.text())
+        self.assertEqual(window.speed_value.text(), "—")
+        window.stop()
+        self.assertTrue(window.progress_metrics.isHidden())
+        window.finished(None, "已取消")
+
     def test_progress_does_not_regress_or_replace_cancellation(self):
         window = self.window
         window.busy = True
@@ -215,7 +269,7 @@ class ExportWindowTests(unittest.TestCase):
         window.progress_value = 0
         window.update_progress(70, "编码")
         window.update_progress(12, "封装")
-        self.assertIn("70%", window.status.text())
+        self.assertEqual("70%", window.percent_value.text())
         self.assertIn("00:02:05", window.status.text())
         window.stop()
         window.update_progress(80, "迟到的状态")

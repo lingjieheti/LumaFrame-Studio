@@ -50,7 +50,7 @@ def _make_sei(header, messages):
     return bytes(unit)
 
 
-def _units(reader, cancel):
+def _units(reader, cancel, on_bytes=None):
     """Yield exact Annex B delimiters and NAL bytes without buffering the file."""
     boundary = re.compile(b"\x00\x00\x00?\x01")
     pending = bytearray()
@@ -75,11 +75,13 @@ def _units(reader, cancel):
         if len(pending) > 128 * 1024 * 1024:
             raise ValueError("HEVC 数据缺少有效的 NAL 边界。")
         search = max(0, len(pending) - 3)
+        if on_bytes is not None:
+            on_bytes(reader.tell())
     if start is not None:
         yield start, bytes(pending)
 
 
-def write_content_light(source, destination, levels, cancel=None):
+def write_content_light(source, destination, levels, cancel=None, *, on_bytes=None):
     """Replace base-layer CLL SEIs and repeat measured values at random access points."""
     if (not isinstance(levels, (list, tuple)) or len(levels) != 2
             or any(type(v) is not int for v in levels) or not 0 <= levels[1] <= levels[0] <= 10000):
@@ -91,7 +93,7 @@ def write_content_light(source, destination, levels, cancel=None):
     try:
         with Path(source).open("rb") as reader, dest.open("xb") as writer:
             created = True
-            for prefix, unit in _units(reader, cancel):
+            for prefix, unit in _units(reader, cancel, on_bytes):
                 if len(unit) < 2 or unit[0] & 0x80 or not unit[1] & 7:
                     raise ValueError("HEVC NAL 头无效。")
                 kind = (unit[0] >> 1) & 63

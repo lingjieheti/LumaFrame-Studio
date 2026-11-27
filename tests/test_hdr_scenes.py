@@ -61,7 +61,11 @@ class HDRShotBoundaries(unittest.TestCase):
                             "lossless=1:bframes=3:keyint=50:log-level=error", source],
                            input=raw, check=True)
             run = engine._Runner(None)
-            measured = hdr.measure_output(source, root, run)
+            events = []
+            measured = hdr.measure_output(source, root, run, expected_frames=len(sequence),
+                                          progress=lambda *event: events.append(event))
+            self.assertEqual(events[0], (0, len(sequence), "scenes"))
+            self.assertEqual(events[-1], (len(sequence), len(sequence), "scenes"))
             self.assertEqual([(s["start"], s["length"]) for s in measured],
                              [(0, 4), (4, 4), (8, 24), (32, 2)])
             planned, encoded, actual = (root / name for name in ("planned.rpu", "out.hevc", "actual.rpu"))

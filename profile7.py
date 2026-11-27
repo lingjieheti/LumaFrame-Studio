@@ -168,7 +168,7 @@ def layers(base, enhancement, expected, width, height, ffprobe, run):
         raise ValueError("基础层与增强层尺寸或逐帧数量不匹配。")
 
 
-def run_pipe(upstream, downstream, run, work, *, failure="双层 HEVC 流式拆分失败。"):
+def run_pipe(upstream, downstream, run, work, *, failure="双层 HEVC 流式拆分失败。", on_poll=None):
     """Pipe the Annex B byte stream without buffering a film in RAM or on disk."""
     cancel = getattr(run, "cancel", None)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -194,6 +194,7 @@ def run_pipe(upstream, downstream, run, work, *, failure="双层 HEVC 流式拆�
                 )
             finally:
                 producer.stdout.close()
+            next_update = 0.0
             while True:
                 if cancel is not None and cancel.is_set():
                     raise InterruptedError("任务已取消。")
@@ -211,6 +212,9 @@ def run_pipe(upstream, downstream, run, work, *, failure="双层 HEVC 流式拆�
                                 label += f" ({status})"
                             messages.append(f"{label} {detail}".rstrip())
                     raise RuntimeError(failure + "\n" + "\n".join(messages))
+                if on_poll is not None and time.monotonic() >= next_update:
+                    on_poll()
+                    next_update = time.monotonic() + 0.5
                 if statuses == (0, 0):
                     return
                 time.sleep(0.05)
@@ -230,6 +234,35 @@ def run_pipe(upstream, downstream, run, work, *, failure="双层 HEVC 流式拆�
             for process in (consumer, producer):
                 if process is not None:
                     process.wait()
+
+
+def run_ffmpeg_pipe(upstream, downstream, run, work, *, on_frame=None, failure="双层 HEVC 流式拆分失败。"):
+    """Report FFmpeg's actual output frames while stdout carries binary media."""
+    if on_frame is None:
+        return run_pipe(upstream, downstream, run, work, failure=failure)
+
+    with tempfile.TemporaryDirectory(dir=work, prefix="ffprogress_") as tmp:
+        path = Path(tmp, "frames.txt")
+        # FFmpeg flushes these small records independently of its binary output.
+        with path.open("w+b") as updates:
+            last = 0
+
+            def report():
+                nonlocal last
+                latest = last
+                while line := updates.readline():
+                    if not line.endswith(b"\n"):
+                        updates.seek(-len(line), 1)
+                        break
+                    if line.startswith(b"frame=") and (value := line[6:].strip()).isdigit():
+                        latest = max(latest, int(value))
+                if latest > last:
+                    last = latest
+                    on_frame(latest)
+
+            command = [upstream[0], "-stats_period", "1", "-progress", str(path), *upstream[1:]]
+            run_pipe(command, downstream, run, work, failure=failure, on_poll=report)
+            report()
 
 
 def prepare(
@@ -261,16 +294,19 @@ def prepare(
     return base, el, rpu, layer, frames
 
 
-def signature(path, cancel, *, ignore_rpu=False, inspect_unit=None):
+def signature(path, cancel, *, ignore_rpu=False, inspect_unit=None, progress=None):
     """Fingerprint coded pictures/SEI in order, and unique decoder parameter sets.
 
     Access unit delimiters and repeated identical VPS/SPS/PPS can legitimately
     differ between Annex B and a container configuration record.
     """
 
+    size = Path(path).stat().st_size if progress is not None else None
+
     def units():
         pattern = re.compile(b"\x00\x00\x00?\x01")
         pending = b""
+        read = 0
         with Path(path).open("rb") as source:
             while chunk := source.read(2 * 1024 * 1024):
                 if cancel is not None and cancel.is_set():
@@ -280,6 +316,10 @@ def signature(path, cancel, *, ignore_rpu=False, inspect_unit=None):
                 pending = pieces[-1]
                 if len(pending) > 128 * 1024 * 1024:
                     raise ValueError("双层 HEVC 数据缺少有效的 NAL 边界。")
+                if progress is not None:
+                    read += len(chunk)
+                    if read < size:
+                        progress(read, size)
             yield pending
 
     sets, frames, payload = set(), 0, hashlib.sha256()
@@ -312,4 +352,7 @@ def signature(path, cancel, *, ignore_rpu=False, inspect_unit=None):
             payload.update(unit)
     if not sets or not frames:
         raise ValueError("增强层或基础层缺少可验证的视频图像。")
-    return frames, hashlib.sha256(b"".join(sorted(sets)) + payload.digest()).hexdigest()
+    result = frames, hashlib.sha256(b"".join(sorted(sets)) + payload.digest()).hexdigest()
+    if progress is not None:
+        progress(size, size)
+    return result

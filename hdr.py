@@ -3,6 +3,7 @@
 import re
 import shutil
 import tempfile
+import time
 from array import array
 from functools import lru_cache
 from pathlib import Path
@@ -60,7 +61,7 @@ def _scene(start, length, minimum, maximum, total):
     }
 
 
-def _shot_starts(marks, levels):
+def _shot_starts(marks, levels, *, cancel=None):
     """Keep scdet hard cuts and recover isolated weaker changes in shot brightness."""
     means = memoryview(levels)[2::3]
     differences = array("f")
@@ -70,6 +71,8 @@ def _shot_starts(marks, levels):
         for line in src:
             if line.startswith("frame:"):
                 index = int(line[6:].split()[0])
+                if index % 1024 == 0 and cancel is not None and cancel.is_set():
+                    raise InterruptedError("任务已取消。")
                 if index != len(differences):
                     raise ValueError("分镜检测的帧序号不连续。")
             elif line.startswith("lavfi.scd.mafd="):
@@ -79,6 +82,8 @@ def _shot_starts(marks, levels):
     if len(differences) != len(means):
         raise ValueError("分镜检测和亮度测量的帧数不同。")
     for i in range(3, len(means) - 3):
+        if i % 1024 == 0 and cancel is not None and cancel.is_set():
+            raise InterruptedError("任务已取消。")
         change = differences[i]
         if change < 4 or i in cuts:
             continue
@@ -97,7 +102,9 @@ def _shot_starts(marks, levels):
     return sorted(cuts)
 
 
-def measure_output(base_file, work_dir, run, *, active_area=None):
+def measure_output(base_file, work_dir, run, *, active_area=None, expected_frames=None, progress=None):
+    if expected_frames is not None and (type(expected_frames) is not int or expected_frames < 1):
+        raise ValueError("逐镜分析需要有效的预期帧数。")
     exe = ROOT / "bin" / "ffmpeg.exe"
     ffmpeg = str(exe) if exe.exists() else shutil.which("ffmpeg")
     if not ffmpeg:
@@ -121,8 +128,12 @@ def measure_output(base_file, work_dir, run, *, active_area=None):
     # Three doubles per frame use about 8 MiB for four hours at 24 fps.
     levels = array("d")
     fields = {}
+    next_update = 0.0
+    if progress is not None:
+        progress(0, expected_frames, "scenes")
 
     def accept():
+        nonlocal next_update
         if "frame" not in fields:
             return
         if int(fields["frame"]) != len(levels) // 3:
@@ -130,6 +141,12 @@ def measure_output(base_file, work_dir, run, *, active_area=None):
         levels.extend(float(fields[k]) for k in (
             "lavfi.signalstats.YMIN", "lavfi.signalstats.VMAX", "lavfi.signalstats.UAVG"
         ))
+        count = len(levels) // 3
+        if progress is not None and (expected_frames is None or count < expected_frames):
+            now = time.monotonic()
+            if now >= next_update:
+                progress(count, expected_frames, "scenes")
+                next_update = now + 0.5
 
     def parse_line(line):
         nonlocal fields
@@ -170,15 +187,22 @@ def measure_output(base_file, work_dir, run, *, active_area=None):
              "-i", str(base_file), "-filter_complex", detector + vf, "-map", "[out]",
              "-an", "-sn", "-f", "null", "-"], parse_line, collect=False)
         accept()
-        cuts = _shot_starts(marks, levels)
+        if expected_frames is not None and len(levels) // 3 != expected_frames:
+            raise ValueError("逐镜亮度分析的实际帧数与输出视频不一致。")
+        cancel = getattr(run, "cancel", None)
+        cuts = _shot_starts(marks, levels, cancel=cancel)
     frames = len(levels) // 3
     if not frames:
         raise ValueError("没有可分析的输出画面。")
     starts = [0, *cuts, frames]
     scenes = []
     for start, end in zip(starts, starts[1:]):
+        if cancel is not None and cancel.is_set():
+            raise InterruptedError("任务已取消。")
         if end <= start:
             raise ValueError("分镜帧序号与亮度分析不一致。")
         scene = memoryview(levels)[start * 3:end * 3]
         scenes.append(_scene(start, end - start, min(scene[0::3]), max(scene[1::3]), sum(scene[2::3])))
+    if progress is not None:
+        progress(frames, frames, "scenes")
     return scenes
