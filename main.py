@@ -378,7 +378,9 @@ class Studio(QMainWindow):
         section.addWidget(label("导出设置", "section"))
         section.addStretch()
         section.addWidget(Glyph("gpu", 15))
-        self.gpu_label = label("检测图形设备…", "device")
+        self.gpu_label = ElidedLabel("检测图形设备…", "device", Qt.ElideRight)
+        self.gpu_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self.gpu_label.setMinimumWidth(1)
         section.addWidget(self.gpu_label)
         cg.addLayout(section)
         self.events.gpu.connect(self.gpu_name)
@@ -675,7 +677,7 @@ class Studio(QMainWindow):
     def caption(self, widget, source):
         self.captions[widget] = source
         widget.setText(source() if callable(source) else self.words.text(source))
-        if widget is self.status:
+        if widget in (self.status, self.gpu_label):
             widget.setToolTip(widget.text())
 
     def gpu_name(self, name):
@@ -716,6 +718,7 @@ class Studio(QMainWindow):
         for setter, source in self.static_properties:
             setter(self.words.text(source))
         self.status.setToolTip(self.status.text())
+        self.gpu_label.setToolTip(self.gpu_label.text())
         for combo in (self.speeds, self.sdr_mapping, self.area_choice, self.languages, self.targets, self.modes):
             for i in range(combo.count()):
                 source = combo.itemData(i, Qt.UserRole + 1)

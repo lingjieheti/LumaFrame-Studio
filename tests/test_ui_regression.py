@@ -55,6 +55,9 @@ class ExportWindowTests(unittest.TestCase):
 
     def test_short_viewport_keeps_format_and_export_in_view(self):
         window = self.window
+        window.events.gpu.disconnect(window.gpu_name)
+        self.app.processEvents()
+        window.gpu_name("未检测到 NVIDIA GPU")
         window.setAttribute(Qt.WA_DontShowOnScreen)
         window.resize(1140, 800)
         window.show()
@@ -65,12 +68,18 @@ class ExportWindowTests(unittest.TestCase):
             with self.subTest(language=code):
                 window.languages.setCurrentIndex(window.languages.findData(code))
                 self.app.processEvents()
+                self.assertEqual(window.gpu_label.toolTip(), window.words.text("未检测到 NVIDIA GPU"))
                 for widget, enclosing in ((window.targets, window.workspace_viewport),
                                           (window.pick, window.stage),
                                           (window.film_detail, window.stage),
                                           (window.renderbtn, window)):
                     rect = QRect(widget.mapTo(enclosing, QPoint()), widget.size())
-                    self.assertTrue(widget.isVisibleTo(enclosing) and enclosing.rect().contains(rect), rect)
+                    self.assertTrue(
+                        widget.isVisibleTo(enclosing) and enclosing.rect().contains(rect),
+                        f"{widget.accessibleName() or widget.objectName()} bounds {rect} in {enclosing.rect()}, "
+                        f"viewport {window.workspace_viewport.size()}, sheet {window.workspace.parentWidget().size()}, "
+                        f"stage {window.stage.size()}, GPU {window.gpu_label.text()!r}, font {widget.font().toString()}",
+                    )
         self.assertLess(window.stage.height(), large_preview)
         window.languages.setCurrentIndex(window.languages.findData("zh-CN"))
         window.resize(1140, 800)
