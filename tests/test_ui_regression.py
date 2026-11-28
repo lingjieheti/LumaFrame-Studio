@@ -30,6 +30,9 @@ class ExportWindowTests(unittest.TestCase):
         with patch.object(main, "QSettings", return_value=settings):
             self.window = main.Studio()
         self.addCleanup(self.window.close)
+        self.enterContext(patch("encode_policy.nvidia_gpu_name", return_value="NVIDIA GeForce RTX 5080"))
+        self.window.events.gpu.disconnect(self.window.gpu_name)
+        self.window.gpu_name("NVIDIA GeForce RTX 5080")
         source = self.directory / "原片.mkv"
         self.window.got_info(0, {
             "path": str(source), "source_type": "dv", "dv_profile": 7,
@@ -38,26 +41,24 @@ class ExportWindowTests(unittest.TestCase):
             "supported": True, "duration": 6.25, "subtitle_count": 0, "audio_count": 1, "reason": "",
         }, "")
 
-    def wait_for_result(self):
+    def wait_for_result(self, window=None):
+        window = window or self.window
         deadline = time.monotonic() + 10
-        while self.window.busy and time.monotonic() < deadline:
+        while window.busy and time.monotonic() < deadline:
             self.app.processEvents()
             time.sleep(0.01)
-        self.assertFalse(self.window.busy)
+        self.assertFalse(window.busy)
 
     def test_native_hdr10_offers_picture_preserving_authoring(self):
         info = dict(self.window.info, dv_profile=None, source_type="hdr10", can_keep7=False, profile="HDR10")
         self.window.got_info(0, info, "")
         self.assertEqual(self.window.targets.currentData(), "newdv")
-        self.assertEqual(self.window.modes.count(), 1)
-        self.assertEqual(self.window.modes.currentData(), "copy")
-        self.assertTrue(self.window.mapping_row.isHidden())
+        self.assertIn("保留原始 HDR10 画面", self.window.plan.text())
 
     def test_short_viewport_keeps_format_and_export_in_view(self):
         window = self.window
-        window.events.gpu.disconnect(window.gpu_name)
         self.app.processEvents()
-        window.gpu_name("未检测到 NVIDIA GPU")
+        window.gpu_name("")
         window.setAttribute(Qt.WA_DontShowOnScreen)
         window.resize(1140, 800)
         window.show()
@@ -86,88 +87,38 @@ class ExportWindowTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(window.stage.height(), large_preview)
 
-    def test_static_hdr10_upscale_and_new_dolby_area_apply_to_the_selected_source(self):
+    def test_default_target_and_explicit_hdr10_use_full_canvas(self):
         window = self.window
         source = dict(window.info, width=1920, height=1080, can_keep7=False, dv_profile=None, source_type="hdr10")
         window.got_info(0, source, "")
-        self.assertEqual(window.targets.currentData(), "hdr10")
-        self.assertEqual(window.modes.currentData(), "rtx")
-        self.assertGreater(window.modes.findData("rtx_compressed"), 0)
-        self.assertFalse(window.area_panel.isHidden())
-        self.assertTrue(window.mapping_row.isHidden())
-        window.area_choice.setCurrentIndex(window.area_choice.findData(2.35))
-        with patch("preview.render_sample", side_effect=ValueError("test finished")) as hdr_sample:
+        self.assertEqual(window.targets.currentData(), "newdv")
+        self.assertIn("RTX", window.plan.text())
+        window.targets.setCurrentIndex(window.targets.findData("hdr10"))
+        with patch("preview.render_sample", side_effect=ValueError("test finished")) as preview:
             window.start(sample=True)
             self.wait_for_result()
-        self.assertEqual(hdr_sample.call_args.kwargs["active_area"], (0, 0, 262, 262))
-        window.targets.setCurrentIndex(window.targets.findData("newdv"))
-        self.assertFalse(window.area_panel.isHidden())
-        window.area_choice.setCurrentIndex(window.area_choice.findData(2.39))
-        with patch("preview.render_sample", side_effect=ValueError("test finished")) as sample:
-            window.start(sample=True)
-            self.wait_for_result()
-        self.assertEqual(sample.call_args.kwargs["active_area"], (0, 0, 276, 276))
-        window.area_choice.setCurrentIndex(window.area_choice.findData("custom"))
-        for field, value in zip(window.margin_inputs, (9, 20, 25, 30)):
-            field.setValue(value)
-        with patch("engine.render", side_effect=ValueError("test finished")) as render:
-            window.start()
-            self.wait_for_result()
-        self.assertEqual(render.call_args.kwargs["active_area"], (9, 20, 25, 30))
-        window.margin_inputs[1].setValue(3840)
-        with patch("engine.render") as render:
-            window.start()
-            self.assertFalse(window.busy)
-            render.assert_not_called()
-        window.got_info(0, dict(source, path="other.mkv"), "")
-        self.assertEqual(window.area_choice.currentData(), "full")
-        self.assertTrue(all(f.value() == 0 for f in window.margin_inputs))
+        self.assertEqual(preview.call_args.args[2], "rtx")
+        self.assertEqual(preview.call_args.kwargs["target"], "hdr10")
+        self.assertIsNone(preview.call_args.kwargs.get("active_area"))
 
-    def test_compression_repair_is_optional_for_smaller_profile8_sources(self):
-        info = dict(self.window.info, dv_profile=8, width=1920, height=1080, can_keep7=False)
-        self.window.got_info(0, info, "")
-        self.assertEqual(self.window.modes.currentData(), "rtx")
-        self.assertGreater(self.window.modes.findData("rtx_compressed"), 0)
-        self.window.got_info(0, dict(info, width=3840, height=2160, can_copy8=True), "")
-        self.assertEqual(self.window.modes.findData("rtx_compressed"), -1)
-
-    def test_rtx_speed_reaches_sample_and_render_only_on_applicable_modes(self):
-        window = self.window
-        source = dict(window.info, dv_profile=8, width=1920, height=1080, can_keep7=False)
+    def test_old_manual_settings_do_not_override_automatic_quality(self):
+        source = dict(self.window.info, source_type="sdr", width=1920, height=1080, can_keep7=False)
+        self.window.settings.setValue("rtxSpeed", "fast")
+        self.window.settings.setValue("sdrMapping", "reference")
+        with patch.object(main, "QSettings", return_value=self.window.settings):
+            window = main.Studio()
+        self.addCleanup(window.close)
+        window.events.gpu.disconnect(window.gpu_name)
+        window.gpu_name("NVIDIA GeForce RTX 5080")
         window.got_info(0, source, "")
-        self.assertFalse(window.speed_field.isHidden())
-        self.assertEqual(window.speeds.currentData(), "quality")
-        self.assertEqual(window.speeds.currentText(), "标准")
-        self.assertIn("相同的超分模型和编码参数", window.hint.text())
-        with patch("engine.render", side_effect=ValueError("test finished")) as render:
-            window.start()
-            self.assertFalse(window.speeds.isEnabled())
-            self.wait_for_result()
-        self.assertEqual(render.call_args.kwargs["speed"], "quality")
-
-        window.speeds.setCurrentIndex(window.speeds.findData("fast"))
-        self.assertEqual(window.speeds.currentText(), "并行加速")
-        self.assertEqual(window.settings.value("rtxSpeed"), "fast")
-        for mode, sample in (("rtx", True), ("rtx_compressed", False), ("reference", True)):
-            with self.subTest(mode=mode):
-                window.modes.setCurrentIndex(window.modes.findData(mode))
-                self.assertEqual(window.speed_field.isHidden(), mode == "reference")
-                with patch("preview.render_sample" if sample else "engine.render",
-                           side_effect=ValueError("test finished")) as worker:
-                    window.start(sample=sample)
-                    self.wait_for_result()
-                self.assertEqual(worker.call_args.kwargs["speed"], "quality" if mode == "reference" else "fast")
-
-        native = dict(source, width=3840, height=2160, can_copy8=True)
-        window.got_info(0, native, "")
-        self.assertEqual(window.modes.currentData(), "copy")
-        self.assertTrue(window.speed_field.isHidden())
-        with patch.object(main, "QSettings", return_value=window.settings):
-            reopened = main.Studio()
-        self.addCleanup(reopened.close)
-        self.assertTrue(reopened.speed_field.isHidden())
-        reopened.got_info(0, source, "")
-        self.assertEqual(reopened.speeds.currentData(), "fast")
+        for sample in (True, False):
+            with self.subTest(sample=sample), patch("preview.render_sample" if sample else "engine.render",
+                    side_effect=ValueError("test finished")) as worker:
+                window.start(sample=sample)
+                self.wait_for_result(window)
+                self.assertEqual(worker.call_args.args[2], "rtx")
+                self.assertEqual(worker.call_args.kwargs["sdr_mapping"], "auto")
+                self.assertEqual(worker.call_args.kwargs["speed"], "quality")
 
     def test_export_command_validates_speed_after_resolving_mode_and_target(self):
         # Explicit CLI options and the default-mode path must agree with the desktop controls.
@@ -197,17 +148,48 @@ class ExportWindowTests(unittest.TestCase):
                     self.assertIn("--speed fast", saved["error"])
                     worker.assert_not_called()
 
-    def test_three_speed_controls_reflow_as_the_window_narrows(self):
+    def test_automatic_grading_starts_without_a_model_dialog(self):
         window = self.window
-        window.got_info(0, dict(window.info, dv_profile=8, width=1920, height=1080, can_keep7=False), "")
+        window.got_info(0, dict(window.info, source_type="sdr", dv_profile=0, width=1920,
+                                height=1080, can_keep7=False), "")
+        self.assertIn("自动逐镜调色", window.plan.text())
+        with patch.object(main.QFileDialog, "getOpenFileName") as picker, \
+                patch("engine.render", side_effect=ValueError("test finished")) as render:
+            window.start()
+            self.wait_for_result()
+        picker.assert_not_called()
+        self.assertEqual(render.call_args.kwargs["sdr_mapping"], "auto")
+        self.assertTrue(window.renderbtn.isEnabled())
+
+    def test_cli_cinema_pack_is_imported_before_render(self):
+        for mapping in ("auto", "cinema"):
+            with self.subTest(mapping=mapping), patch("cinema_lut.install_model") as install:
+                report = self.directory / f"{mapping}.json"
+                args = [self.window.info["path"], "--output", str(self.directory / "out.mkv"),
+                        "--result", str(report), "--mode", "reference", "--target", "newdv",
+                        "--cinema-model", "pack.zip"]
+                if mapping == "cinema":
+                    args.extend(["--sdr-mapping", mapping])
+
+                def render(*args, **kwargs):
+                    install.assert_called_once_with("pack.zip")
+                    self.assertEqual(kwargs["sdr_mapping"], mapping)
+                    return {"verified": True}
+
+                with patch("engine.render", side_effect=render):
+                    self.assertEqual(main.export_command(args), 0)
+                self.assertTrue(json.loads(report.read_text("utf-8"))["verified"])
+
+    def test_processing_summary_reflows_as_the_window_narrows(self):
+        window = self.window
         window.show()
         grid = window.setting_fields
-        for width, expected in [(1100, (0, 2, 1, 1)), (920, (1, 0, 1, 2)), (720, (2, 0, 1, 1))]:
+        for width, position in ((1140,(0,1)), (920,(0,1)), (720,(1,0))):
             with self.subTest(width=width):
                 window.resize(width, 480)
                 self.app.processEvents()
-                self.assertEqual(grid.getItemPosition(grid.indexOf(window.speed_field)), expected)
-                self.assertTrue(window.speed_field.isVisible())
+                self.assertEqual(grid.getItemPosition(grid.indexOf(window.plan_field))[:2], position)
+                self.assertTrue(window.plan.isVisible())
                 self.assertTrue(window.renderbtn.isVisible())
 
     def test_suggested_destination_belongs_to_the_current_movie(self):
@@ -297,19 +279,44 @@ class ExportWindowTests(unittest.TestCase):
         self.assertTrue(self.window.renderbtn.isEnabled())
         self.assertIsNone(QApplication.activeModalWidget())
 
-    def test_native_p81_defaults_to_copy_and_sdr_mapping_reaches_worker(self):
+    def test_native_p81_defaults_to_copy_and_switching_source_resets_processing(self):
         window = self.window
         p81 = dict(window.info, dv_profile=8, can_keep7=False, can_copy8=True, profile="Dolby Vision Profile 8.1")
         window.got_info(0, p81, "")
-        self.assertEqual((window.targets.currentData(), window.modes.currentData()), ("preserve", "copy"))
-        self.assertTrue(window.mapping_row.isHidden())
+        self.assertEqual(window.targets.currentData(), "preserve")
+        self.assertIn("无损封装", window.plan.text())
         window.got_info(0, dict(p81, source_type="sdr", can_copy8=False, dv_profile=None, profile="SDR BT.709"), "")
-        self.assertFalse(window.mapping_row.isHidden())
-        window.sdr_mapping.setCurrentIndex(window.sdr_mapping.findData("reference"))
-        with patch("engine.render", side_effect=ValueError("test finished")) as render:
+        self.assertIn("自动逐镜调色", window.plan.text())
+        with patch("preview.render_sample", side_effect=ValueError("test preview")) as preview:
+            window.previewbtn.click()
+            self.wait_for_result()
+        self.assertEqual(preview.call_args.kwargs["sdr_mapping"], "auto")
+        window.got_info(0, p81, "")
+        with patch("engine.render", side_effect=ValueError("test HDR source")) as native:
             window.renderbtn.click()
             self.wait_for_result()
-        self.assertEqual(render.call_args.kwargs["sdr_mapping"], "reference")
+        self.assertEqual(native.call_args.args[2], "copy")
+        self.assertEqual(native.call_args.kwargs["sdr_mapping"], "expand")
+        self.assertNotIn("逐镜调色", window.plan.text())
+
+    def test_per_shot_grading_fits_the_scrolled_workspace(self):
+        window = self.window
+        window.setAttribute(Qt.WA_DontShowOnScreen)
+        window.got_info(0, dict(window.info, source_type="sdr", dv_profile=None, can_keep7=False,
+                                width=1920, height=1080, profile="SDR BT.709"), "")
+        summary = window.plan
+        window.show()
+        viewport = window.workspace_viewport
+        for size in ((720, 480), (1140, 800)):
+            window.resize(*size)
+            for code in ("en", "ja", "zh-CN"):
+                with self.subTest(size=size, language=code):
+                    window.languages.setCurrentIndex(window.languages.findData(code))
+                    self.app.processEvents()
+                    viewport.parentWidget().ensureWidgetVisible(summary)
+                    bounds = QRect(summary.mapTo(viewport, QPoint()), summary.size())
+                    self.assertTrue(viewport.rect().contains(bounds))
+                    self.assertGreaterEqual(summary.height(), summary.heightForWidth(summary.width()))
 
 
 if __name__ == "__main__":

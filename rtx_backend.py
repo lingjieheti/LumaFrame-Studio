@@ -448,7 +448,8 @@ def run_worker(params):
         from hdr import sdr_filter
 
         init_args, expansion = sdr_filter(
-            iw, ih, iw, ih, "reference", mapping=params.get("sdr_mapping", "expand"), output_rgb=True
+            iw, ih, iw, ih, "reference", mapping=params.get("sdr_mapping", "expand"), output_rgb=True,
+            scene_shader=params.get("scene_shader"),
         )
         full = source_range == "full" or stream["pix_fmt"].startswith("yuvj")
         tagging = "setparams=range=" + ("full" if full else "limited")

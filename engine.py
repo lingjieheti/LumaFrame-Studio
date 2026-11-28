@@ -660,6 +660,7 @@ def _gpu_command(source, output, info, mode, target, rpu, master, cll, *, fel_in
         hw_decode=min(info["width"], info["height"]) >= 128,
         sdr_to_hdr=info.get("source_type") == "sdr",
         sdr_mapping=info.get("sdr_mapping", "expand"),
+        scene_shader=info.get("scene_shader"),
         fel_input=fel_input,
         compressed_source=info.get("compressed_source", False),
         speed=info.get("speed", "quality"),
@@ -685,7 +686,7 @@ def _software_command(source, out, info, video, mode, target, master, cll):
         from hdr import sdr_filter
 
         init_args, vf = sdr_filter(info["width"], info["height"], w, h, mode,
-                                   mapping=info.get("sdr_mapping", "expand"))
+                                   mapping=info.get("sdr_mapping", "expand"), scene_shader=info.get("scene_shader"))
         full = video.get("color_range") == "pc" or video["pix_fmt"].startswith("yuvj")
         vf = (
             "setparams=range="
@@ -1049,8 +1050,14 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
             raise ValueError("压缩片源修复仅适用于需要放大的静态 HDR10 或 Dolby Vision Profile 8.1。")
         info["compressed_source"] = True
         mode = "rtx"
-    if sdr_mapping not in {"expand", "reference"} or (sdr_mapping != "expand" and info["source_type"] != "sdr"):
+    if sdr_mapping == "auto" and info["source_type"] != "sdr":
+        sdr_mapping = "expand"
+    if sdr_mapping not in {"expand", "reference", "scene", "cinema", "auto"} or (sdr_mapping != "expand" and info["source_type"] != "sdr"):
         raise ValueError("亮度映射仅适用于 SDR 片源，请选择有效的映射方式。")
+    if sdr_mapping == "cinema":
+        from cinema_lut import require_model
+
+        require_model()
     info["sdr_mapping"] = sdr_mapping
     info["speed"] = speed
     native = target == "keep7"
@@ -1156,6 +1163,36 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
         generation_levels = {}
         measured_levels = None
         frame_total = len(times)
+        if sdr_mapping in {"scene", "cinema", "auto"}:
+            from hdr import write_scene_shader
+            from shot_grade import analyze_shots
+
+            encode_start = prep_end
+            automatic = sdr_mapping == "auto"
+            scan_grade_end = (scan_end + encode_start) / 2 if sdr_mapping != "scene" else encode_start
+            grade = _Stage(progress, "grade", "分析 SDR 镜头与高光分布", "frames", scan_end, scan_grade_end)
+            grade(0, frame_total)
+            source_offsets = tuple(round(offset * dimension / output) for offset, dimension, output in zip(
+                offsets, (info["width"], info["width"], info["height"], info["height"]),
+                (canvas[0], canvas[0], canvas[1], canvas[1])))
+            shots = analyze_shots(source, video, times, scratch, run, progress=grade, active_area=source_offsets, auto=automatic)
+            use_model = sdr_mapping == "cinema"
+            if automatic:
+                from cinema_lut import ensure_auto_model
+
+                candidates = sum(shot["auto_cinema"] for shot in shots)
+                use_model = candidates > 0 and ensure_auto_model()
+                model_shots = candidates if use_model else 0
+            if use_model:
+                from cinema_lut import prepare_grades
+                from cinema_shader import write_cinema_shader
+
+                learn = _Stage(progress, "cinema_lut", "计算逐镜电影调色模型", "frames", scan_grade_end, encode_start)
+                basis, records = prepare_grades(source, video, times, shots, scratch, run, progress=learn,
+                                               active_area=source_offsets, selected_only=automatic)
+                info["scene_shader"] = write_cinema_shader(scratch, basis, records, neural=mode == "neural", cancel=cancel)
+            else:
+                info["scene_shader"] = write_scene_shader(scratch, shots, neural=mode == "neural")
         prep_mid = (scan_end + prep_end) / 2
         prep = _Stage(progress, "extract", "提取原始视频轨", "frames", scan_end, prep_mid)
 
@@ -1628,6 +1665,13 @@ def render(path, destination, mode, progress, cancel, *, target="preserve", sdr_
             result["measured_content_light"] = dict(max_cll_nits=peak, max_fall_nits=frame_average)
         if info["source_type"] == "sdr":
             result["sdr_mapping"] = sdr_mapping
+            if sdr_mapping in {"scene", "cinema", "auto"}:
+                result["graded_shots"] = len(shots)
+                result["extended_white_shots"] = sum(1 for shot in shots if shot.get("headroom"))
+                if sdr_mapping == "auto":
+                    result["auto_model_shots"] = model_shots
+                    result["auto_adaptive_shots"] = len(shots) - model_shots
+                    result["auto_model_unavailable_shots"] = candidates - model_shots
         if target in {"hdr10", "newdv"}:
             result["active_area"] = dict(zip(("left", "right", "top", "bottom"), offsets))
         if container_digest:

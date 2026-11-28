@@ -15,6 +15,20 @@ vec3 nits_to_pq(vec3 v)
 vec4 hook()
 {
     vec4 s = HOOKED_tex(HOOKED_pos);
+#ifdef LF_SHOT_GRADE
+    vec3 grade = shot_grade();
+#ifdef LF_EXTENDED_WHITE
+    // Positive luma excursions are present in some video-range masters.
+    // Make room before RGB clipping. The gradual shoulder uses one common
+    // scale for R'G'B'; black and ordinary midtones keep their original values.
+    float reserve = grade.b * (20.0 / 219.0);
+    float signal = dot(s.rgb, vec3(0.2126, 0.7152, 0.0722));
+    if (reserve > 0.0 && signal > 0.8) {
+        float x = clamp((signal - 0.8) / (0.2 + reserve), 0.0, 1.0);
+        s.rgb *= 1.0 - reserve * x * x / signal;
+    }
+#endif
+#endif
     vec3 linear709 = pow(clamp(s.rgb, 0.0, 1.0), vec3(2.4));
     // D65 linear-light primary conversion, rows expressed as dot products.
     vec3 rgb = 203.0 * vec3(
@@ -32,7 +46,22 @@ vec4 hook()
     // the black, middle grey and chromaticities from the normal conversion remain intact.
     const float knee = 120.0, white = 203.0, peak = 1000.0;
     float t = clamp((y - knee) / (white - knee), 0.0, 1.0);
+#ifdef LF_SHOT_GRADE
+    // Broad textured whites use a softer shoulder. Sparse glints can gain a
+    // little separation; the additional lift peaks at 34 nits and tapers to
+    // zero at the ceiling. High-key or heavily clipped shots keep the source look.
+    float sparse = smoothstep(0.82, 0.98, grade.x);
+    float shoulder = mix(t, 1.0 + 0.4 * (1.0 - t), sparse);
+    shoulder = mix(shoulder, 1.0, grade.y);
+    // A window can have a clipped light core and a textured surround in the
+    // same shot. Fade out attenuation towards the ceiling, even when the
+    // surround occupies most of the frame. Sparse highlights retain their lift.
+    float weight = grade.x * shoulder;
+    weight = mix(weight, max(weight, 1.0), smoothstep(0.38, 0.94, t));
+    float mapped = min(y, white) + weight * (peak - white) * t*t*t;
+#else
     float mapped = min(y, white) + (peak - white) * t*t*t;
+#endif
     float gain = mapped / max(y, 0.00001);
     // Limit the brightest linear RGB channel, preserving chromaticity.
     gain = min(gain, peak / max(max(rgb.r, rgb.g), max(rgb.b, 0.00001)));

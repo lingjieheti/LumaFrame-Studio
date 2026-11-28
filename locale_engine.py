@@ -208,6 +208,11 @@ ENGINE_MESSAGES = {
         "Reading source frame timestamps",
         "元映像の各フレームのタイムスタンプを読み取り中",
     ),
+    "计算逐镜电影调色模型": ("Computing per-shot cinema grades", "ショットごとの映画調色を計算中"),
+    "当前亮度映射不使用逐镜调色模型。": (
+        "The selected tone mapping mode does not use the per-shot grading model.",
+        "選択した輝度マッピングではショット別調色モデルを使用しません。",
+    ),
     "核对增强层逐帧时间戳": (
         "Checking enhancement-layer frame timestamps",
         "拡張レイヤーの各フレームのタイムスタンプを照合中",
@@ -295,6 +300,10 @@ ENGINE_MESSAGES = {
     "测量杜比视界逐镜亮度": (
         "Measuring luminance by scene for Dolby Vision",
         "Dolby Vision用にシーンごとの輝度を測定中",
+    ),
+    "分析 SDR 镜头与高光分布": (
+        "Analyzing SDR shots and highlight distribution",
+        "SDR映像のショットとハイライトの分布を解析中",
     ),
     "生成逐帧杜比视界元数据": (
         "Generating Dolby Vision metadata for each frame",
@@ -767,6 +776,82 @@ ENGINE_MESSAGES = {
     "未知的 SDR 到 HDR 亮度映射。": (
         "Unknown SDR-to-HDR luminance mapping.",
         "不明なSDRからHDRへの輝度マッピングです。",
+    ),
+    "逐镜调色缺少源画面时间戳。": (
+        "Per-shot grading requires source frame timestamps.",
+        "ショット別調整に必要な入力フレームのタイムスタンプがありません。",
+    ),
+    "逐镜调色的解码帧与源画面时间戳不一致。": (
+        "The decoded frames do not match the source timestamps during per-shot grading.",
+        "ショット別調整でデコードしたフレームと入力タイムスタンプが一致しません。",
+    ),
+    "逐镜调色缺少有效的画面测量值。": (
+        "Per-shot grading could not read valid frame measurements.",
+        "ショット別調整に必要な有効なフレーム測定値を取得できません。",
+    ),
+    "逐镜调色缺少有效的解码时间戳。": (
+        "Per-shot grading could not read a valid decoded frame timestamp.",
+        "ショット別調整でデコードしたフレームの有効なタイムスタンプを取得できません。",
+    ),
+    "逐镜调色的分析帧数与源画面不一致。": (
+        "Per-shot grading analyzed a different number of frames than the source contains.",
+        "ショット別調整で解析したフレーム数が入力のフレーム数と一致しません。",
+    ),
+    "逐镜调色的分镜帧序号无效。": (
+        "Per-shot grading found an invalid frame index at a shot boundary.",
+        "ショット別調整で検出したショット境界のフレーム番号が無効です。",
+    ),
+    "逐镜调色的源画面有效区域无效。": (
+        "The source active area for per-shot grading is invalid.",
+        "ショット別調整で解析する入力映像の有効領域が無効です。",
+    ),
+    "逐镜调色的帧序号或高光强度无效。": (
+        "The frame index or highlight strength for per-shot grading is invalid.",
+        "ショット別調整のフレーム番号またはハイライトの強度が無効です。",
+    ),
+    "逐镜调色的帧数超出支持范围。": (
+        "The frame count exceeds the supported range for per-shot grading.",
+        "フレーム数がショット別調整の対応範囲を超えています。",
+    ),
+    "学习型调色参数必须是零到一之间的有限数值。": (
+        "Model grading parameters must be finite values between zero and one.",
+        "モデル調色のパラメーターには 0 から 1 までの有限の値を指定してください。",
+    ),
+    "学习型调色基础 LUT 尺寸不正确。": (
+        "The base LUT dimensions are invalid for model grading.",
+        "モデル調色用の基底 LUT のサイズが正しくありません。",
+    ),
+    "学习型调色基础 LUT 存在无效数值。": (
+        "The base LUT for model grading contains invalid values.",
+        "モデル調色用の基底 LUT に無効な値が含まれています。",
+    ),
+    "学习型调色的帧数或镜头数超出支持范围。": (
+        "The frame or shot count exceeds the supported range for model grading.",
+        "フレーム数またはショット数がモデル調色の対応範囲を超えています。",
+    ),
+    "学习型调色的模型参数维度不正确。": (
+        "The model grading parameters have invalid dimensions.",
+        "モデル調色のパラメーターの次元が正しくありません。",
+    ),
+    "缺少完整的电影调色模型，请导入官方模型包。": (
+        "The cinema grading model is missing or incomplete. Import the official model pack.",
+        "映画調色モデルが不足しています。公式モデルパックをインポートしてください。",
+    ),
+    "电影调色模型包校验失败，请选择完整的官方 ZIP 文件。": (
+        "The cinema grading model pack failed verification. Select the complete official ZIP file.",
+        "映画調色モデルパックの検証に失敗しました。完全な公式 ZIP ファイルを選択してください。",
+    ),
+    "电影调色的代表帧与源画面不一致。": (
+        "The representative frames for cinema grading do not match the source timeline.",
+        "映画調色の代表フレームが入力映像のタイムラインと一致しません。",
+    ),
+    "电影调色模型推理失败。": (
+        "Cinema grading model inference failed.",
+        "映画調色モデルの推論に失敗しました。",
+    ),
+    "缺少已校验的逐镜调色方案。": (
+        "A verified per-shot grading plan is required.",
+        "ショット別調整に必要な検証済みの設定がありません。",
     ),
     "分镜检测的帧序号不连续。": (
         "Frame numbers are not consecutive during shot detection.",

@@ -1,4 +1,4 @@
-# LumaFrame Studio 1.1.2 的第三方组件
+# LumaFrame Studio 的第三方组件
 
 从源码构建 Windows x64 版时，在项目根目录运行 `py -3.12 tools/fetch_tools.py`。脚本只使用 Python 标准库；解压 7z 需要已安装的 7-Zip。每次安装均验证完整下载的 SHA-256，再按文件清单提取到 `bin`、`shaders` 和 `licenses`。镜像缓存可用 `--cache` 指定，缓存文件同样经过校验。Python 包版本见 `requirements-build.txt`。[下载清单与完整校验值](tools/fetch_tools.py) · [7-Zip](https://www.7-zip.org/)
 
@@ -34,6 +34,14 @@
 | CPython 3.12.10 | Python 解释器及标准库。PSF 与历史组件许可见 `licenses/Python-3.12.10.txt` | [CPython v3.12.10](https://github.com/python/cpython/tree/v3.12.10) |
 | PyInstaller 6.16.0 | Windows 独立目录打包。GPL 及 bootloader 特例的原文见 `licenses/PyInstaller-6.16.0.txt` | [PyInstaller v6.16.0](https://github.com/pyinstaller/pyinstaller/tree/v6.16.0) |
 | Inno Setup 6、7-Zip | 分别生成 Windows 安装程序、解开上游压缩包；源码构建时由构建者安装 | [Inno Setup 许可](https://jrsoftware.org/files/is/license.txt) · [7-Zip 许可](https://www.7-zip.org/license.txt) |
+
+## 自动逐镜调色使用的 ITM-LUT 模型
+
+`LumaFrame-Cinema-LUT-v1.zip` 随完整安装版提供，用于自动逐镜调色选中的镜头。模型来自 Cheng Guo、Leidong Fan、Qian Zhang、Hanyuan Liu、Kanglin Liu 和 Xiuhua Jiang 的 ITM-LUT。转换采用作者提交 `05efa83199a08649a2f3f3355d94e2cee624f774` 的 `params.pth` 和 `network.py`，把三个权重预测分支导出为 ONNX，把训练好的三维 LUT 基底按小端 float32 保存。上游项目根目录提供 MPL-2.0 许可，模型包附 `ITM-LUT-MPL-2.0.txt`。[固定版本的模型、网络和许可](https://github.com/AndreGuo/ITMLUT/tree/05efa83199a08649a2f3f3355d94e2cee624f774)
+
+模型包使用 Microsoft ONNX Runtime 1.20.1 Windows x64 CPU 版，附 `ONNXRuntime-LICENSE.txt`（MIT）、`ONNXRuntime-notices.txt`、推理辅助程序的 C++ 源码及 `SOURCES.txt`。导入时逐文件核验 SHA-256。着色器、保护曲线及镜头分析在本项目中提供。[ONNX Runtime 对应版本](https://github.com/microsoft/onnxruntime/tree/v1.20.1)
+
+开发者可通过 `python tools/build_cinema_model.py <ITM-LUT源码目录> <onnxruntime_c_api.h路径> <输出目录>` 复现模型转换。构建使用 Windows x64、MinGW-w64 的 `g++`、支持 ONNX 导出的 PyTorch、ONNX 及 ONNX Runtime 1.20.1 CPU。脚本校验作者权重、网络和 ORT 头文件，并输出模型 ZIP 与逐文件摘要。[转换脚本](tools/build_cinema_model.py) · [ORT 1.20.1 官方头文件](https://github.com/microsoft/onnxruntime/blob/v1.20.1/include/onnxruntime/core/session/onnxruntime_c_api.h)
 
 ## 可选 NVIDIA RTX Video Effects
 

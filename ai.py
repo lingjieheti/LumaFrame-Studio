@@ -40,6 +40,7 @@ def nvenc_command(
     sdr_to_hdr=False,
     fel_input=None,
     sdr_mapping="expand",
+    scene_shader=None,
     compressed_source=False,
     speed="quality",
 ):
@@ -72,6 +73,8 @@ def nvenc_command(
         )
         if compressed_source:
             payload["compressed_source"] = True
+        if scene_shader is not None:
+            payload["scene_shader"] = str(scene_shader)
         if speed == "fast":
             payload["speed"] = speed
         if fel_input is not None:

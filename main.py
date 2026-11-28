@@ -58,7 +58,6 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
-    QSpinBox,
 )
 import glass
 from export_progress import ExportProgress, ProgressFeed, ProgressFile, clock_text, eta_text, rate_text, work_text
@@ -66,7 +65,9 @@ from glass import ASSETS, GlassButton, Material, Rail, Stage, Select, ink
 from material_sample import MaterialSample
 from localization import LANGUAGES, Translator, resolve_language
 
-VERSION = "1.5.2"
+from encode_policy import nvidia_gpu_name, output_targets, recommended_mode
+
+VERSION = "1.8.1"
 REPO = "https://github.com/lingjieheti/LumaFrame-Studio"
 SPONSOR = "https://github.com/lingjieheti/suzerain-save-studio/blob/main/SPONSOR.md"
 TARGETS = {
@@ -89,27 +90,6 @@ HIDE = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 def supports_fast_export(mode, target):
     return mode in {"rtx", "rtx_compressed"} and target in {"preserve", "hdr10", "newdv"}
-
-
-def centered_margins(width, height, ratio):
-    """Choose symmetric, even pixel insets close to the requested display ratio."""
-    if width / height < ratio:
-        inset = max(0, 2 * round((height - width / ratio) / 4))
-        return 0, 0, inset, inset
-    inset = max(0, 2 * round((width - height * ratio) / 4))
-    return inset, inset, 0, 0
-
-
-def output_targets(info):
-    if info.get("can_keep7"):
-        return ["keep7", "preserve"]
-    if info["source_type"] == "dv":
-        return ["preserve"]
-    if info["source_type"] == "hdr10" and (info["width"], info["height"]) == (
-        info["target_width"], info["target_height"]
-    ):
-        return ["newdv"]
-    return ["hdr10", "newdv"]
 
 
 def label(text, kind=""):
@@ -266,6 +246,7 @@ class Studio(QMainWindow):
         self.setMinimumSize(min(720, width), min(480, height))
         self.resize(min(1120, width), min(680, height))
         self.info = None
+        self.device_name = None
         self.busy = False
         self.progress_tracker = ExportProgress()
         self.started_at = None
@@ -385,83 +366,27 @@ class Studio(QMainWindow):
         cg.addLayout(section)
         self.events.gpu.connect(self.gpu_name)
         self.targets = Select()
-        self.modes = Select()
-        self.speeds = Select()
-        self.speeds.addItem("标准", "quality")
-        self.speeds.addItem("并行加速", "fast")
-        if self.settings.value("rtxSpeed") == "fast":
-            self.speeds.setCurrentIndex(1)
-        self.speeds.setToolTip("标准模式使用常规缓冲。并行加速增加缓冲，让 RTX 超分与编码并行。试转和整片使用相同设置。")
         self.targets.setPlaceholderText("根据片源匹配")
-        self.modes.setPlaceholderText("根据分辨率推荐")
+        self.targets.setAccessibleName("输出格式")
+        self.targets.setMinimumWidth(0)
+        self.targets.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.setting_fields = layout(QGridLayout, None, 0, 14)
-        self.field_groups = []
+        self.format_field = QWidget()
+        field = layout(QVBoxLayout, self.format_field, 0, 6)
+        cap = label("输出格式", "field")
+        cap.setBuddy(self.targets)
+        field.addWidget(cap)
+        field.addWidget(self.targets)
+        self.plan_field = QWidget()
+        field = layout(QVBoxLayout, self.plan_field, 0, 6)
+        field.addWidget(label("自动处理", "field"))
+        self.plan = label("", "guideTitle")
+        self.plan.setWordWrap(True)
+        self.plan.setAccessibleName("自动处理")
+        field.addWidget(self.plan, 1)
         self.field_columns = None
-        for title, combo in [
-            ("输出格式", self.targets), ("画质模式", self.modes), ("速度模式", self.speeds)
-        ]:
-            group = QWidget()
-            field = layout(QVBoxLayout, group, 0, 6)
-            cap = label(title, "field")
-            cap.setBuddy(combo)
-            combo.setAccessibleName(title)
-            combo.setMinimumWidth(0)
-            combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-            field.addWidget(cap)
-            field.addWidget(combo)
-            self.field_groups.append(group)
-            if combo is self.speeds:
-                self.speed_field = group
-                group.hide()
         self.arrange_fields()
         cg.addLayout(self.setting_fields)
-        self.mapping_row = QWidget()
-        mapping_layout = layout(QHBoxLayout, self.mapping_row, 0, 12)
-        mapping_label = label("SDR 亮度映射", "field")
-        self.sdr_mapping = Select()
-        self.sdr_mapping.setAccessibleName(mapping_label.text())
-        mapping_label.setBuddy(self.sdr_mapping)
-        self.sdr_mapping.addItem("扩展高光 · 最高 1000 尼特", "expand")
-        self.sdr_mapping.addItem("保留 SDR 明暗关系 · 参考白 203 尼特", "reference")
-        mapping_layout.addWidget(mapping_label)
-        mapping_layout.addWidget(self.sdr_mapping, 1)
-        cg.addWidget(self.mapping_row)
-        self.area_panel = QWidget()
-        area_layout = layout(QVBoxLayout, self.area_panel, 0, 6)
-        area_row = layout(QHBoxLayout, None, 0, 12)
-        area_label = label("亮度分析区域", "field")
-        self.area_choice = Select()
-        area_label.setBuddy(self.area_choice)
-        self.area_choice.setAccessibleName("亮度分析区域")
-        self.area_choice.setToolTip("按输出画幅排除固定黑边，成片保留完整画布。可变画幅请使用完整画幅。")
-        self.area_choice.addItem("完整画幅", "full")
-        for name, ratio in (("1.85∶1", 1.85), ("2.35∶1", 2.35), ("2.39∶1", 2.39), ("4∶3", 4 / 3)):
-            self.area_choice.addItem(name + " · 居中有效画面", ratio)
-        self.area_choice.addItem("自定四边 · 成片像素", "custom")
-        area_row.addWidget(area_label)
-        area_row.addWidget(self.area_choice, 1)
-        area_layout.addLayout(area_row)
-        self.area_custom = QWidget()
-        custom_row = layout(QHBoxLayout, self.area_custom, 0, 5)
-        self.margin_inputs = []
-        for direction in ("左", "右", "上", "下"):
-            field = QSpinBox()
-            field.setRange(0, 4095)
-            field.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
-            field.setAccessibleName(direction + "边距，成片像素")
-            field.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-            cap = label(direction, "field")
-            cap.setBuddy(field)
-            custom_row.addWidget(cap)
-            custom_row.addWidget(field, 1)
-            self.margin_inputs.append(field)
-        area_layout.addWidget(self.area_custom)
-        self.area_custom.hide()
-        self.area_panel.hide()
-        self.area_choice.currentIndexChanged.connect(
-            lambda: self.area_custom.setVisible(self.area_choice.currentData() == "custom")
-        )
-        cg.addWidget(self.area_panel)
         out = layout(QVBoxLayout, None, 0, 6)
         pb = layout(QHBoxLayout, None, 0, 8)
         self.path = QLineEdit()
@@ -482,8 +407,6 @@ class Studio(QMainWindow):
         self.hint.setWordWrap(True)
         cg.addWidget(self.hint)
         self.targets.currentIndexChanged.connect(self.target_change)
-        self.modes.currentIndexChanged.connect(self.mode_change)
-        self.speeds.currentIndexChanged.connect(self.speed_change)
         box.addStretch()
         self.export_dock = glass.ExportDock()
         self.export_dock.setObjectName("exportDock")
@@ -642,16 +565,7 @@ class Studio(QMainWindow):
         QShortcut(QKeySequence.Open, self, activated=self.choose)
 
         def probe_gpu():
-            try:
-                out = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                    capture_output=True,
-                    timeout=6,
-                    creationflags=HIDE,
-                )
-                name = out.stdout.decode(errors="replace").strip().splitlines()[0]
-            except (OSError, IndexError, subprocess.TimeoutExpired):
-                name = "未检测到 NVIDIA GPU"
+            name = nvidia_gpu_name()
             # The desktop window can close before the system GPU query returns.
             try:
                 self.events.gpu.emit(name)
@@ -670,9 +584,8 @@ class Studio(QMainWindow):
                 read = getattr(widget, getter, None)
                 if read and (text := read()):
                     self.static_properties.append((getattr(widget, setter), text))
-        for combo in (self.speeds, self.sdr_mapping, self.area_choice, self.languages):
-            for i in range(combo.count()):
-                combo.setItemData(i, combo.itemText(i), Qt.UserRole + 1)
+        for i in range(self.languages.count()):
+            self.languages.setItemData(i, self.languages.itemText(i), Qt.UserRole + 1)
 
     def caption(self, widget, source):
         self.captions[widget] = source
@@ -681,11 +594,11 @@ class Studio(QMainWindow):
             widget.setToolTip(widget.text())
 
     def gpu_name(self, name):
-        self.caption(self.gpu_label, name if name == "未检测到 NVIDIA GPU" else lambda: name)
+        self.device_name = name
+        self.caption(self.gpu_label, (lambda: name) if name else "未检测到 NVIDIA GPU")
+        self.update_plan()
 
     def option_text(self, source):
-        if source.endswith(" · 居中有效画面"):
-            return self.words.text("{ratio} · 居中有效画面", ratio=source.split(" · ")[0])
         if source.startswith("杜比视界 Profile ") and " → " in source:
             return self.words.text("杜比视界 Profile {profile} → Profile 8.1", profile=source.split()[2])
         return self.words.text(source)
@@ -719,14 +632,13 @@ class Studio(QMainWindow):
             setter(self.words.text(source))
         self.status.setToolTip(self.status.text())
         self.gpu_label.setToolTip(self.gpu_label.text())
-        for combo in (self.speeds, self.sdr_mapping, self.area_choice, self.languages, self.targets, self.modes):
+        for combo in (self.languages, self.targets):
             for i in range(combo.count()):
                 source = combo.itemData(i, Qt.UserRole + 1)
                 if source:
                     combo.setItemText(i, self.option_text(source))
         self.resize_rail()
-        if self.info and self.info.get("supported"):
-            self.mode_change()
+        self.update_plan()
         self.refresh_history()
         if self.busy:
             self.show_progress()
@@ -771,19 +683,17 @@ class Studio(QMainWindow):
 
     def arrange_fields(self):
         columns = 1 if self.width() < 775 else 2
-        if self.width() >= 1080 and not self.speed_field.isHidden():
-            columns = 3
         if columns == self.field_columns:
             return
         self.field_columns = columns
-        for group in self.field_groups:
-            self.setting_fields.removeWidget(group)
-        for col, stretch in enumerate((5, 5 if columns > 1 else 0, 2 if columns == 3 else 0)):
-            self.setting_fields.setColumnStretch(col, stretch)
-        for i, group in enumerate(self.field_groups):
-            row, col = divmod(i, columns)
-            span = 2 if columns == 2 and group is self.speed_field else 1
-            self.setting_fields.addWidget(group, row, col, 1, span)
+        self.setting_fields.removeWidget(self.plan_field)
+        self.setting_fields.addWidget(self.format_field, 0, 0)
+        self.setting_fields.setColumnStretch(0, 1)
+        self.setting_fields.setColumnStretch(1, int(columns == 2))
+        if columns == 2:
+            self.setting_fields.addWidget(self.plan_field, 0, 1)
+        else:
+            self.setting_fields.addWidget(self.plan_field, 1, 0)
 
     def size_preview(self, compact):
         self.compact_preview = compact
@@ -873,11 +783,11 @@ class Studio(QMainWindow):
         QLabel#progressMetric {{font-size:15px;font-weight:600;color:{fg};}}
         QFrame#card {{background:{card};border:1px solid {edge};border-radius:20px;}}
         QFrame#rule {{background:{edge};border:0;}}
-        QLineEdit,QComboBox,QSpinBox {{background:{field_bg};padding:7px 12px;border-radius:10px;border:1px solid {edge};min-height:20px;}}
+        QLineEdit,QComboBox {{background:{field_bg};padding:7px 12px;border-radius:10px;border:1px solid {edge};min-height:20px;}}
         QComboBox {{padding-right:28px;}}
         QComboBox:disabled {{color:{mut};}}
-        QComboBox:enabled:hover,QLineEdit:hover,QSpinBox:hover {{border-color:{mut};}}
-        QComboBox:focus,QLineEdit:focus,QSpinBox:focus {{border:2px solid {accent};padding:6px 11px;}}
+        QComboBox:enabled:hover,QLineEdit:hover {{border-color:{mut};}}
+        QComboBox:focus,QLineEdit:focus {{border:2px solid {accent};padding:6px 11px;}}
         QComboBox:focus {{padding-right:27px;}}
         QComboBox::drop-down {{border:0;width:26px;background:transparent;}}
         QComboBox::down-arrow {{width:0;height:0;}}
@@ -902,8 +812,7 @@ class Studio(QMainWindow):
             QWidget.update(w)
 
     def set_controls(self, enabled):
-        for w in (self.renderbtn, self.previewbtn, self.browse, self.targets, self.modes, self.speeds, self.sdr_mapping,
-                  self.area_panel):
+        for w in (self.renderbtn, self.previewbtn, self.browse, self.targets):
             w.setEnabled(enabled)
 
     def choose(self):
@@ -983,10 +892,6 @@ class Studio(QMainWindow):
     def got_info(self, seq, info, err):
         if seq != self.seq:
             return
-        self.area_panel.hide()
-        self.area_choice.setCurrentIndex(0)
-        for field in self.margin_inputs:
-            field.setValue(0)
         self.info = info
         self.status.show()
         if err:
@@ -1011,14 +916,9 @@ class Studio(QMainWindow):
         self.targets.blockSignals(True)
         self.targets.clear()
         info = self.info or {}
-        self.mapping_row.setVisible(bool(info.get("supported") and info.get("source_type") == "sdr"))
         if not info.get("supported"):
-            self.area_panel.hide()
-            self.speed_field.hide()
-            self.arrange_fields()
             self.targets.blockSignals(False)
-            self.modes.clear()
-            self.hint.hide()
+            self.update_plan()
             return
         keys = output_targets(info)
         for key in keys:
@@ -1031,89 +931,45 @@ class Studio(QMainWindow):
         self.target_change()
 
     def target_change(self, *_):
-        k = self.targets.currentData()
-        self.area_panel.setVisible(k in {"hdr10", "newdv"})
-        self.modes.blockSignals(True)
-        self.modes.clear()
-        keys = (
-            ["rtx", "neural", "reference", "quality"]
-            if k == "preserve"
-            else ["rtx", "neural", "reference"]
-        )
-        if k == "preserve" and self.info and self.info.get("dv_profile") in (5, 7):
-            keys = ["rtx", "neural", "reference"]
-        if self.info and self.info["supported"]:
-            ratio = min(
-                self.info["target_width"] / self.info["width"],
-                self.info["target_height"] / self.info["height"],
-            )
-            if ratio <= 1.30:
-                keys = [key for key in keys if key != "neural"]
-            if ratio <= 1.0:
-                keys = ["reference"]
-            elif (k == "preserve" and self.info.get("dv_profile") == 8) or self.info.get("source_type") == "hdr10":
-                keys.insert(1, "rtx_compressed")
-            if k == "preserve" and self.info.get("can_copy8"):
-                keys.insert(0, "copy")
-            if self.info.get("source_type") == "hdr10" and (self.info["width"], self.info["height"]) == (
-                self.info["target_width"], self.info["target_height"]
-            ):
-                keys = ["copy"]
-        for key in keys:
-            name = MODES[key]
-            if k == "keep7":
-                name = "无损封装 · 原始双层码流"
-            elif k == "newdv" and key == "copy":
-                name = "保留 HDR10 原画面 · 生成动态元数据"
-            elif (k == "preserve" and key == "reference" and self.info.get("can_keep7")
-                  and self.info.get("profile", "").endswith(" · MEL")):
-                name = "保留原始基础层 · 转换杜比元数据"
-            elif key == "reference" and self.info.get("source_type") == "sdr":
-                name = "Spline36 · 高位深扩展"
-            self.add_option(self.modes, name, key)
-        self.modes.setCurrentIndex(0)
-        self.modes.blockSignals(False)
-        self.mode_change()
+        self.update_plan()
         self.suggest_dest()
 
-    def mode_change(self, *_):
-        key = self.modes.currentData()
-        rtx_speed = supports_fast_export(key, self.targets.currentData())
-        self.speed_field.setVisible(rtx_speed)
-        self.arrange_fields()
-        tips = {
-            "copy": "片源已达到输出尺寸，直接保留原始 HEVC 画面、HDR 信号和杜比动态元数据。",
-            "rtx": "10 位 AI 超分与高码率编码，适合优质电影片源。首次使用需下载约 416 MiB 的 NVIDIA 运行库。",
-            "rtx_compressed": "适合有压缩噪声的片源。轻度时空降噪后进行 RTX 超分。颗粒和文件大小可能变化，可先试转。",
-            "neural": "使用 NVIDIA GPU 增强亮度细节，以 x265 慢速 CRF 14 编码。",
-            "reference": "使用高位深 Spline36 与 x265 慢速编码。画面有移动细纹、织物或胶片纹理时，可先试转比较。",
-            "quality": "采用 NVIDIA Image Scaling 与硬件编码，适合快速导出。",
-        }
+    def update_plan(self):
+        target = self.targets.currentData()
+        ready = bool(target and self.info and self.info.get("supported"))
+        self.plan_field.setVisible(ready)
+        self.hint.hide()
+        if not ready:
+            return
+        if self.device_name is None:
+            self.plan.setText(self.words.text("正在匹配处理方案…"))
+            return
+        mode = recommended_mode(self.info, target, gpu_name=self.device_name)
         tr = self.words.text
-        text = tr(tips.get(key, ""))
-        if self.targets.currentData() == "keep7":
-            text = tr("直接保留原始画质和逐帧杜比数据。此格式需要支持 Profile 7 的播放器。")
-        elif self.info and self.info.get("dv_profile") == 7 and self.targets.currentData() == "preserve":
-            text += " " + tr("导出前会读取增强层，生成 HDR10 兼容的单层 Profile 8.1。")
-            if (key == "reference" and self.info.get("can_keep7")
-                    and self.info.get("profile", "").endswith(" · MEL")):
-                text = tr("全片确认为 MEL 时，沿用原始 HEVC 基础层，并将逐帧杜比元数据转换为 Profile 8.1。")
-            if "FEL" in self.info.get("profile", ""):
-                text += " " + tr("重建的 12 位画面逐帧送入后续处理，请为分层码流和成片封装预留磁盘空间。")
-        elif self.info and self.info.get("source_type") == "hdr10" and key == "copy":
-            text = tr("沿用原始 HDR10 画面和母版亮度，逐镜测量生成杜比动态元数据。")
-        elif self.targets.currentData() == "newdv":
-            text += " " + tr("按新画面测量生成杜比动态元数据。")
-        if rtx_speed:
-            if self.speeds.currentData() == "fast":
-                text += " " + tr("并行加速增加缓冲，让超分与编码并行。")
-            text += " " + tr("两档使用相同的超分模型和编码参数。")
-        self.hint.setText(text)
-        self.hint.setVisible(bool(self.info and self.info.get("supported") and text))
-
-    def speed_change(self):
-        self.settings.setValue("rtxSpeed", self.speeds.currentData())
-        self.mode_change()
+        hint = ""
+        if target == "keep7":
+            name = tr("原始双层无损封装")
+            hint = "直接保留原始画质和逐帧杜比数据。此格式需要支持 Profile 7 的播放器。"
+        elif mode == "copy":
+            name = tr("保留原始 HDR10 画面") if target == "newdv" else tr("无损封装 · 原始单层码流")
+            if target == "newdv":
+                hint = "沿用原始 HDR10 画面和母版亮度，逐镜测量生成杜比动态元数据。"
+        else:
+            native = (self.info["width"], self.info["height"]) == (self.info["target_width"], self.info["target_height"])
+            name = tr("高位深转换" if native else MODES[mode])
+            if mode == "rtx":
+                name = tr("RTX 超分")
+                hint = "首次使用 RTX 超分时会自动获取 NVIDIA 运行库（约 416 MiB）。"
+            if self.info["source_type"] == "sdr":
+                name += " · " + tr("自动逐镜调色")
+            if self.info.get("dv_profile") == 7:
+                hint = "导出前会读取增强层，生成 HDR10 兼容的单层 Profile 8.1。"
+                if self.info.get("can_keep7") and self.info.get("profile", "").endswith(" · MEL"):
+                    name = tr("保留原始基础层 · 转换杜比元数据")
+                    hint = "全片确认为 MEL 时，沿用原始 HEVC 基础层，并将逐帧杜比元数据转换为 Profile 8.1。"
+        self.plan.setText(name)
+        self.hint.setText(tr(hint) if hint else "")
+        self.hint.setVisible(bool(hint))
 
     def suggest_dest(self):
         if not self.info or not self.info["supported"]:
@@ -1147,23 +1003,9 @@ class Studio(QMainWindow):
             dest = available_destination(dest.with_name(dest.stem + "-" + self.words.text("试片") + ".mkv"))
         dest = str(dest)
         src = self.info["path"]
-        mode = self.modes.currentData()
         target = self.targets.currentData()
-        speed = self.speeds.currentData() if supports_fast_export(mode, target) else "quality"
-        mapping = self.sdr_mapping.currentData() if self.info["source_type"] == "sdr" else "expand"
-        active_area = None
-        choice = self.area_choice.currentData()
-        if target in {"hdr10", "newdv"} and choice != "full":
-            import dovi
-            canvas = self.info["target_width"], self.info["target_height"]
-            margins = (tuple(f.value() for f in self.margin_inputs) if choice == "custom"
-                       else centered_margins(*canvas, choice))
-            try:
-                active_area = dovi.validate_active_area(margins, *canvas)
-            except ValueError as exc:
-                self.caption(self.status, lambda error=str(exc): self.words.message(error))
-                self.status.show()
-                return
+        info, device_name = self.info, self.device_name
+        mapping = "auto" if info["source_type"] == "sdr" else "expand"
         self.busy = True
         self.cancel_event = threading.Event()
         self.started_at = time.monotonic()
@@ -1188,6 +1030,7 @@ class Studio(QMainWindow):
             try:
                 import engine
 
+                mode = recommended_mode(info, target, gpu_name=device_name)
                 if sample:
                     from preview import render_sample
 
@@ -1198,15 +1041,14 @@ class Studio(QMainWindow):
                         feed,
                         self.cancel_event,
                         target=target,
-                        duration=self.info["duration"],
+                        duration=info["duration"],
                         sdr_mapping=mapping,
-                        active_area=active_area,
-                        speed=speed,
+                        speed="quality",
                     )
                 else:
                     res = engine.render(
                         src, dest, mode, feed, self.cancel_event, target=target,
-                        sdr_mapping=mapping, active_area=active_area, speed=speed,
+                        sdr_mapping=mapping, speed="quality",
                     )
                 self.events.complete.emit(res, "")
             except Exception as exc:
@@ -1411,12 +1253,17 @@ def export_command(argv):
     parser.add_argument("--mode", choices=tuple(MODES))
     parser.add_argument("--speed", choices=("quality", "fast"), default="quality",
                         help="RTX pipeline: quality (standard buffers, default) or fast (parallel). Same model and encoding settings.")
-    parser.add_argument("--sdr-mapping", choices=("expand", "reference"), default="expand",
-                        help="SDR only: expand highlights to 1000 nits or map SDR white to 203 nits")
+    parser.add_argument("--sdr-mapping", metavar="{auto,expand,reference}", default="auto",
+                        help="For SDR, automatically select grading per shot (default), extend highlights to "
+                             "1000 nits (expand), or use 203-nit SDR white (reference).")
+    parser.add_argument("--cinema-model", metavar="ZIP", help="Import a verified model pack for automatic per-shot grading.")
     parser.add_argument("--sample", action="store_true")
     parser.add_argument("--active-area", type=int, nargs=4, metavar=("LEFT", "RIGHT", "TOP", "BOTTOM"),
                         help="New HDR10 or Dolby Vision: fixed analysis insets in output pixels, keeping the full canvas")
     options = parser.parse_args(argv)
+    # Existing headless jobs can still request either legacy grading method.
+    if options.sdr_mapping not in {"auto", "expand", "reference", "scene", "cinema"}:
+        parser.error("--sdr-mapping must be auto, expand, or reference")
     words = Translator(resolve_language(options.language, QLocale.system().uiLanguages()))
     result_file = Path(options.result)
     media_paths = {Path(options.input).resolve(), Path(options.output).resolve()}
@@ -1429,6 +1276,11 @@ def export_command(argv):
     with report:
         live = None
         try:
+            if options.cinema_model:
+                if options.sdr_mapping not in {"auto", "cinema"}:
+                    raise ValueError("当前亮度映射不使用逐镜调色模型。")
+                from cinema_lut import install_model
+                install_model(options.cinema_model)
             if options.progress_file:
                 if Path(options.progress_file).resolve() in media_paths | {result_file.resolve()}:
                     raise ValueError("进度文件必须与片源、成片和验收结果使用不同的路径。")
@@ -1441,11 +1293,7 @@ def export_command(argv):
                 if not options.target:
                     options.target = output_targets(data)[0]
                 if not options.mode:
-                    native = (data["width"], data["height"]) == (data["target_width"], data["target_height"])
-                    if (data["source_type"] == "hdr10" and native) or (options.target == "preserve" and data.get("can_copy8")):
-                        options.mode = "copy"
-                    else:
-                        options.mode = "reference" if native else "rtx"
+                    options.mode = recommended_mode(data, options.target)
             if options.speed == "fast" and not supports_fast_export(options.mode, options.target):
                 raise ValueError("--speed fast 仅适用于实际放大的 RTX 模式（rtx、rtx_compressed）。")
             if options.sample:

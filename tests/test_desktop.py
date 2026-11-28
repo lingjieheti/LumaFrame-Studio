@@ -64,15 +64,16 @@ def run(source=None, pictures=None):
             "target_width": 3840, "target_height": 2160, "supported": True,
             "path": str(Path(temp) / "dual.mkv"), "can_keep7": True,
         }
+        window.gpu_name("NVIDIA GeForce RTX 5080")
         window.info = p7
         window.refill_targets()
-        assert window.targets.currentData() == "keep7" and window.modes.count() == 1
-        assert "无损" in window.modes.currentText() and "-P7" in window.path.text()
+        assert window.targets.currentData() == "keep7"
+        assert "无损" in window.plan.text() and "-P7" in window.path.text()
         window.targets.setCurrentIndex(window.targets.findData("preserve"))
-        assert window.modes.currentData() == "reference" and "Profile 8.1" in window.hint.text()
+        assert "Profile 8.1" in window.hint.text()
         window.info = dict(p7, width=1920, height=1080, can_keep7=False)
         window.refill_targets()
-        assert window.targets.count() == 1 and window.modes.currentData() == "rtx"
+        assert window.targets.count() == 1 and "RTX" in window.plan.text()
         window.info = None
         if source:
             window.load(str(Path(source).resolve()))
@@ -80,8 +81,8 @@ def run(source=None, pictures=None):
             assert window.info and window.info["supported"], window.status.text()
             assert window.renderbtn.isEnabled() and window.previewbtn.isEnabled()
             assert window.path.text().endswith(".mkv")
-            assert window.targets.count() and window.modes.count()
-            print(window.film_detail.text(), window.modes.currentData())
+            assert window.targets.count() and window.plan.text()
+            print(window.film_detail.text(), window.plan.text())
             if pictures and window.info.get("can_keep7"):
                 window.nav[0].click()
                 window.path.setText("D:/影片/双层杜比测试片-4K-DV-P7.mkv")

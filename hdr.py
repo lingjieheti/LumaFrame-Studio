@@ -30,12 +30,65 @@ def _combined_shader(neural, reference):
     return folder, combined
 
 
-def sdr_filter(width, height, target_width, target_height, mode, *, mapping="expand", output_rgb=False):
-    if mapping not in {"expand", "reference"}:
+def write_scene_shader(folder, shots, *, neural=False):
+    """Pack the shoulder settings for each display frame in a read-only GPU texture."""
+    grades = bytearray()
+    shots = tuple(shots)
+    extended = any(shot.get("headroom", 0) for shot in shots)
+    channels = 4 if extended else 2
+    for shot in shots:
+        length, strength = shot["length"], shot["strength"]
+        high_key = shot["high_key"]
+        reserve = shot.get("headroom", 0)
+        start = len(grades) // channels
+        if (shot["start"] != start or type(length) is not int or length < 1 or not 0 <= strength <= 1
+                or not 0 <= high_key <= 1 or not 0 <= reserve <= 1):
+            raise ValueError("逐镜调色的帧序号或高光强度无效。")
+        if start + length > 4096 * 4096:
+            raise ValueError("逐镜调色的帧数超出支持范围。")
+        pixel = bytes([round(strength * 255), round(high_key * 255)])
+        if extended:
+            pixel += bytes([round(reserve * 255), 0])
+        grades.extend(pixel * length)
+    frames = len(grades) // channels
+    if not frames:
+        raise ValueError("逐镜调色的帧数超出支持范围。")
+    width = min(frames, 4096)
+    height = max(2, (frames + width - 1) // width)
+    grades.extend(grades[-channels:] * (width * height - frames))
+    fmt = "rgba8" if extended else "rg8"
+    texture = (f"//!TEXTURE LF_SHOT\n//!SIZE {width} {height}\n//!FORMAT {fmt}\n"
+               "//!FILTER NEAREST\n" + grades.hex() + "\n")
+    upscale = SHADER.read_text(encoding="utf-8") + "\n" if neural else ""
+    # libplacebo counts executed shader passes starting at one. In the combined
+    # FSRCNNX graph each LUMA pass runs once, followed by this single MAIN pass.
+    stride = 1 + upscale.count("//!HOOK LUMA\n")
+    control = (
+        "#define LF_SHOT_GRADE\nvec3 shot_grade() {\n"
+        f"    int i = frame / {stride} - 1;\n"
+        f"    return texelFetch(LF_SHOT, ivec2(i % {width}, i / {width}), 0).rgb;\n"
+        "}\n"
+    )
+    hdr = (ROOT / "shaders" / "SDR_highlights_1000.glsl").read_text(encoding="utf-8")
+    if extended:
+        control = "#define LF_EXTENDED_WHITE\n" + control
+    header, body = hdr.split("\n\n", 1)
+    path = Path(folder) / "shot_grade.glsl"
+    path.write_text(upscale + texture + header + "\n//!BIND LF_SHOT\n\n" + control + body, encoding="utf-8")
+    return path
+
+
+def sdr_filter(width, height, target_width, target_height, mode, *, mapping="expand", output_rgb=False,
+               scene_shader=None):
+    if mapping not in {"expand", "reference", "scene", "cinema", "auto"}:
         raise ValueError("未知的 SDR 到 HDR 亮度映射。")
     shader = ROOT / "shaders" / "SDR_highlights_1000.glsl"
     neural = mode == "neural" and min(target_width / width, target_height / height) > 1.30
-    if neural or mapping == "reference":
+    if mapping in {"scene", "cinema", "auto"}:
+        if scene_shader is None or not Path(scene_shader).is_file():
+            raise ValueError("缺少已校验的逐镜调色方案。")
+        shader = scene_shader
+    elif neural or mapping == "reference":
         shader = _combined_shader(neural, mapping == "reference")[1]
     init, graph = gpu_filter(
         width, height, target_width, target_height, neural=False, inverse=False,

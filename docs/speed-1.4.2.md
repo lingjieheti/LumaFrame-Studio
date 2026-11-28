@@ -1,6 +1,6 @@
 # RTX 超分的标准与并行加速
 
-打开需要放大的影片，选择 NVIDIA RTX AI 或 RTX 压缩片源修复。在「速度模式」里可选「标准」或「并行加速」。首次使用默认标准，软件记住之后的选择。五秒试片和整片导出使用同一档。命令行对应 `--speed quality` 和 `--speed fast`。
+以下界面步骤对应 1.4.2。自 1.8.1 起，桌面程序自动确定超分方式并使用标准缓冲。使用 1.4.2 时，先打开需要放大的影片，选择 NVIDIA RTX AI 或 RTX 压缩片源修复。在「速度模式」里可选「标准」或「并行加速」。首次使用默认标准，软件记住之后的选择。五秒试片和整片导出使用同一档。命令行对应 `--speed quality` 和 `--speed fast`。
 
 两档使用同一条画面处理链。常规 RTX 模式采用 HighBitrate Ultra、强度 1.0。压缩片源修复采用 Ultra、强度 0.6。两档的 RGB10A2 超分输入输出、PQ 转换、色度抽样、HEVC Main10 编码参数及杜比元数据处理一致。[NVIDIA VFX 视频超分文档](https://docs.nvidia.com/maxine/vfx/latest/Filters/VideoSuperResolution.html)
 

@@ -1,7 +1,7 @@
 #ifndef StageDir
   #error Build using tools/build.ps1
 #endif
-#define StudioVersion "1.5.2"
+#define StudioVersion "1.8.1"
 [Setup]
 AppId={{E839665F-01D2-43AC-BA81-5C5B30A03C17}
 AppName=LumaFrame Studio

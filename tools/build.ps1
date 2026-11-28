@@ -7,6 +7,9 @@ $dist = Join-Path $Output "dist"
 $stage = Join-Path $dist "LumaFrameStudio"
 Push-Location -LiteralPath $sourceRoot
 try {
+    $modelPack = Join-Path $sourceRoot "assets/models/LumaFrame-Cinema-LUT-v1.zip"
+    & $Python -c "import sys; from cinema_lut import verify_pack; verify_pack(sys.argv[1])" $modelPack
+    if ($LASTEXITCODE) { throw "Missing or invalid bundled cinema model." }
     foreach ($item in @("bin/ffmpeg.exe","bin/ffprobe.exe","bin/dovi_tool.exe","bin/mkvtoolnix/mkvmerge.exe","bin/nvenc/NVEncC64.exe")) {
         if (-not (Test-Path -LiteralPath $item)) { throw "Missing $item. Run python tools/fetch_tools.py first." }
     }

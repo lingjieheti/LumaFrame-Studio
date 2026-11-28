@@ -27,6 +27,7 @@ class Languages(unittest.TestCase):
         self.settings = QSettings(str(folder / "prefs.ini"), QSettings.IniFormat)
         self.settings.setValue("uiLanguage", "zh-CN")
         self.source = folder / "导入影片 {1}.mkv"
+        self.enterContext(patch("main.nvidia_gpu_name", return_value="NVIDIA GeForce RTX 5080"))
         self.window = self.open_window()
 
     def open_window(self):
@@ -50,6 +51,14 @@ class Languages(unittest.TestCase):
         self.settings.setValue("dark", True)
         self.assertEqual(self.open_window().words.code, "zh-CN")
 
+    def test_automatic_sdr_grading_is_the_cli_default(self):
+        result = self.source.parent / "cli-default.json"
+        with patch("engine.render", return_value={"verified": True}) as render:
+            code = main.export_command([str(self.source), "--output", str(self.source.with_suffix(".out.mkv")),
+                                        "--result", str(result), "--target", "newdv", "--mode", "rtx"])
+        self.assertEqual(code, 0)
+        self.assertEqual(render.call_args.kwargs["sdr_mapping"], "auto")
+
     def test_live_localization_preserves_ongoing_work_and_preferences(self):
         w = self.window
         w.caption(w.film, lambda: self.source.name)
@@ -58,18 +67,15 @@ class Languages(unittest.TestCase):
                         "target_width": 3840, "target_height": 2160, "supported": True,
                         "duration": 12, "audio_count": 2, "subtitle_count": 3, "reason": ""}, "")
         w.targets.setCurrentIndex(w.targets.findData("newdv"))
-        w.speeds.setCurrentIndex(w.speeds.findData("fast"))
-        w.area_choice.setCurrentIndex(w.area_choice.findData("custom"))
-        w.margin_inputs[2].setValue(40)
+        w.gpu_name("NVIDIA GeForce RTX 5080")
         w.slider.setValue(68)
         dest = w.path.text()
         self.select("en")
         self.assertEqual(w.film.text(), self.source.name)
-        self.assertNotRegex(w.status.text() + w.hint.text() + w.modes.currentText(), r"[\u3400-\u9fff]")
+        self.assertNotRegex(w.status.text() + w.hint.text() + w.plan.text(), r"[\u3400-\u9fff]")
         self.assertIn("3840", w.status.text())
         self.assertEqual(w.path.text(), dest)
-        self.assertEqual(w.speeds.currentData(), "fast")
-        self.assertEqual(w.margin_inputs[2].value(), 40)
+        self.assertIn("Auto shot grading", w.plan.text())
         self.assertEqual(w.density_value.text(), "68%")
         w.busy = True
         self.addCleanup(setattr, w, "busy", False)
@@ -81,9 +87,11 @@ class Languages(unittest.TestCase):
         self.assertEqual("40%", w.percent_value.text())
         self.assertFalse(w.cancel_event.is_set())
         self.assertEqual(w.targets.currentData(), "newdv")
+        self.assertIn("ショット別", w.plan.text())
         w.finished(None, "字幕轨的起始时间发生了变化。")
         self.assertNotIn("导出未完成", w.status.text())
-        self.assertEqual(self.open_window().words.code, "ja")
+        reopened = self.open_window()
+        self.assertEqual(reopened.words.code, "ja")
         self.select("zh-CN")
         self.assertIn("字幕轨", w.status.text())
 
@@ -91,10 +99,11 @@ class Languages(unittest.TestCase):
         result = self.source.parent / "result.json"
         progress = result.with_name("progress.json")
         error = "字幕轨的起始时间发生了变化。"
-        with patch("engine.render", side_effect=ValueError(error)):
+        with patch("engine.render", side_effect=ValueError(error)) as render:
             code = main.export_command([str(self.source), "--output", str(self.source.with_suffix(".out.mkv")),
                 "--result", str(result), "--progress-file", str(progress), "--language", "en",
-                "--target", "newdv", "--mode", "rtx"])
+                "--target", "newdv", "--mode", "rtx", "--sdr-mapping", "scene"])
+        self.assertEqual(render.call_args.kwargs["sdr_mapping"], "scene")
         self.assertEqual(code, 1)
         expected = Translator("en").message(error)
         self.assertNotEqual(expected, error)

@@ -2,6 +2,16 @@
 
 
 GUI_MESSAGES = {
+    "自动处理": ("Automatic processing", "自動処理"),
+    "正在匹配处理方案…": ("Checking the processing method…", "処理方法を判定中…"),
+    "原始双层无损封装": ("Lossless dual-layer remux", "元のデュアルレイヤーを無劣化で再多重化"),
+    "保留原始 HDR10 画面": ("Preserve the original HDR10 picture", "元の HDR10 映像を保持"),
+    "高位深转换": ("High-bit-depth conversion", "高ビット深度変換"),
+    "RTX 超分": ("RTX Super Resolution", "RTX 超解像"),
+    "首次使用 RTX 超分时会自动获取 NVIDIA 运行库（约 416 MiB）。": (
+        "The first RTX upscale downloads the NVIDIA runtime (about 416 MiB).",
+        "RTX 超解像の初回使用時に NVIDIA ランタイム（約 416 MiB）を取得します。",
+    ),
     "选择影片后即可导出": ("Select a video to export", "動画を選択すると書き出せます"),
     # Navigation and import
     "影片工作台": ("Workspace", "ワークスペース"),
@@ -102,9 +112,10 @@ GUI_MESSAGES = {
         "どちらの処理モードでも超解像モデルとエンコード設定は同じです。",
     ),
     # HDR analysis and export location
-    "SDR 亮度映射": ("SDR luminance mapping", "SDR 輝度マッピング"),
+    "SDR 亮度映射": ("SDR tone mapping", "SDR 輝度マッピング"),
     "扩展高光 · 最高 1000 尼特": ("Expand highlights · up to 1000 nits", "ハイライトを拡張 · 最大 1000 ニト"),
     "保留 SDR 明暗关系 · 参考白 203 尼特": ("Preserve SDR contrast · 203-nit reference white", "SDR の明暗を保持 · 基準白 203 ニト"),
+    "自动逐镜调色": ("Auto shot grading", "ショット別自動調色"),
     "亮度分析区域": ("Luminance analysis area", "輝度の解析範囲"),
     "按输出画幅排除固定黑边，成片保留完整画布。可变画幅请使用完整画幅。": (
         "Exclude fixed black bars from analysis using the output dimensions. The exported frame stays intact. Use the full frame for variable aspect ratios.",
