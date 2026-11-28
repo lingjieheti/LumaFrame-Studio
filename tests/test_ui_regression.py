@@ -27,10 +27,14 @@ class ExportWindowTests(unittest.TestCase):
         self.directory = Path(temp)
         settings = QSettings(str(self.directory / "preferences.ini"), QSettings.IniFormat)
         settings.setValue("uiLanguage", "zh-CN")
+        # The desktop emits a queued hardware result while the window opens.
+        # Mock both entry points before any window starts its probe thread.
+        gpu = "NVIDIA GeForce RTX 5080"
+        self.enterContext(patch.object(main, "nvidia_gpu_name", return_value=gpu))
+        self.enterContext(patch("encode_policy.nvidia_gpu_name", return_value=gpu))
         with patch.object(main, "QSettings", return_value=settings):
             self.window = main.Studio()
         self.addCleanup(self.window.close)
-        self.enterContext(patch("encode_policy.nvidia_gpu_name", return_value="NVIDIA GeForce RTX 5080"))
         self.window.events.gpu.disconnect(self.window.gpu_name)
         self.window.gpu_name("NVIDIA GeForce RTX 5080")
         source = self.directory / "原片.mkv"
